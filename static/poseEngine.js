@@ -8,7 +8,7 @@ import {
   PoseLandmarker,
   FilesetResolver,
   DrawingUtils
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm/vision_bundle.mjs";
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
 export class PoseEngine {
   constructor() {

@@ -171,7 +171,20 @@ async def root():
         return FileResponse(index_path)
     return {"message": "DanceCheck Server is running. static/index.html not found."}
 
+@app.get("/{file_name:path}")
+async def serve_static_fallback(file_name: str):
+    """루트 경로 정적 파일 요청 및 SPA fallback 대응"""
+    target_path = os.path.join(STATIC_DIR, file_name)
+    if os.path.isfile(target_path):
+        return FileResponse(target_path)
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    raise HTTPException(status_code=404, detail="File Not Found")
+
 if __name__ == "__main__":
     import uvicorn
+    # Render 및 클라우드 배포 환경의 PORT 환경 변수 지원 (기본 8000)
+    port = int(os.environ.get("PORT", 8000))
     # CPU 150%, 1GB RAM 환경에 맞춘 경량 단일 워커 구동
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, workers=1)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, workers=1)
