@@ -80,6 +80,8 @@ class DanceCheckApp {
     this.currentFacingMode = "user"; // 'user' (전면) or 'environment' (후면)
     this.stream = null;
     this.isRunning = false;
+    this.isFlipping = false;
+    this.loopGeneration = 0;
     this.lastProcessedResult = null;
 
     // 챌린지 모드 상태
@@ -133,14 +135,27 @@ class DanceCheckApp {
    * 카메라 권한 획득 및 스트리밍 시작 (iOS Safari / Android Chrome 호환)
    */
   async startCamera() {
+    // 이전 루프 무효화
+    this.loopGeneration++;
+    const currentGen = this.loopGeneration;
+
     if (this.stream) {
-      this.stream.getTracks().forEach(track => track.stop());
+      try {
+        this.stream.getTracks().forEach(track => track.stop());
+      } catch (e) {
+        console.warn("트랙 종료 경고:", e);
+      }
+      this.stream = null;
     }
+
+    // 엔진 버퍼 및 캔버스 초기화
+    this.poseEngine.reset();
+    this.canvasCtx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
     const constraints = {
       audio: false,
       video: {
-        facingMode: this.currentFacingMode,
+        facingMode: { ideal: this.currentFacingMode },
         width: { ideal: 640 },
         height: { ideal: 800 }
       }
@@ -149,12 +164,25 @@ class DanceCheckApp {
     try {
       this.stream = await navigator.mediaDevices.getUserMedia(constraints);
       this.video.srcObject = this.stream;
+
+      // 비디오 메타데이터 로드 대기 (해상도 0x0 상태에서 AI 추론 시도 방지)
+      await new Promise((resolve) => {
+        if (this.video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+          resolve();
+        } else {
+          this.video.onloadedmetadata = () => resolve();
+        }
+      });
+
       await this.video.play();
 
+      this.applyCameraMirroring();
       this.startOverlay.classList.remove("active");
       this.isRunning = true;
-      this.requestFrameLoop();
-      this.showToast("카메라가 활성화되었습니다.");
+
+      // 이전 세대 루프가 겹치지 않도록 현재 세대로만 단일 루프 실행
+      this.requestFrameLoop(currentGen);
+      this.showToast(this.currentFacingMode === "user" ? "전면 카메라 활성화" : "후면 카메라 활성화");
     } catch (err) {
       console.error("카메라 접근 오류:", err);
       let errMsg = "카메라에 접근할 수 없습니다. 권한을 확인해주세요.";
@@ -166,27 +194,39 @@ class DanceCheckApp {
     }
   }
 
+  applyCameraMirroring() {
+    if (this.currentFacingMode === "environment") {
+      this.video.style.transform = "none";
+      this.canvas.style.transform = "none";
+    } else {
+      this.video.style.transform = "scaleX(-1)";
+      this.canvas.style.transform = "scaleX(-1)";
+    }
+  }
+
   async toggleCameraFlip() {
-    this.currentFacingMode = this.currentFacingMode === "user" ? "environment" : "user";
-    if (this.isRunning) {
-      await this.startCamera();
-      // 후면 카메라일 경우 미러링 해제
-      if (this.currentFacingMode === "environment") {
-        this.video.style.transform = "none";
-        this.canvas.style.transform = "none";
-      } else {
-        this.video.style.transform = "scaleX(-1)";
-        this.canvas.style.transform = "scaleX(-1)";
+    if (this.isFlipping) return;
+    this.isFlipping = true;
+    this.cameraFlipBtn.disabled = true;
+
+    try {
+      this.currentFacingMode = this.currentFacingMode === "user" ? "environment" : "user";
+      if (this.isRunning) {
+        await this.startCamera();
       }
+    } finally {
+      this.isFlipping = false;
+      this.cameraFlipBtn.disabled = false;
     }
   }
 
   /**
-   * 렌더링 및 추론 루프
+   * 렌더링 및 추론 루프 (중복 실행 방지 generation 적용)
    */
-  requestFrameLoop() {
+  requestFrameLoop(generation) {
     const loop = (timestamp) => {
-      if (!this.isRunning) return;
+      // 카메라 전환 등으로 세대가 바뀌었거나 정지된 경우 루프 자연 종료
+      if (!this.isRunning || generation !== this.loopGeneration) return;
 
       if (this.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         this.renderFrame(timestamp);
@@ -249,7 +289,7 @@ class DanceCheckApp {
     // 3. 실시간 상태 배지
     this.liveStatusBadge.className = "live-status-badge";
     if (!landmarks || !checklist.is_body_detected) {
-      this.liveStatusText.textContent = "인물 감지 대기 중";
+      this.liveStatusText.textContent = "전신/골반 감지 대기 중 (뒤로 물러서주세요)";
     } else if (isDancing) {
       this.liveStatusBadge.classList.add("dancing");
       this.liveStatusText.textContent = "🔥 춤 감지 중! (Dancing)";
