@@ -156,8 +156,9 @@ class DanceCheckApp {
       audio: false,
       video: {
         facingMode: { ideal: this.currentFacingMode },
-        width: { ideal: 640 },
-        height: { ideal: 800 }
+        width: { ideal: 480, max: 640 },
+        height: { ideal: 640, max: 800 },
+        frameRate: { ideal: 30, max: 30 }
       }
     };
 
@@ -286,19 +287,28 @@ class DanceCheckApp {
     this.danceScoreText.textContent = `${metrics.dance_score}%`;
     this.danceScoreBar.style.width = `${metrics.dance_score}%`;
 
-    // 3. 실시간 상태 배지 (다인원 정보 반영)
+    // 3. 실시간 상태 배지 (다인원 및 댄스 상태 정보 반영)
     this.liveStatusBadge.className = "live-status-badge";
-    const personPrefix = (result.personCount && result.personCount > 1) ? `👥 ${result.personCount}명 ` : "";
+    const personCount = result.personCount || 0;
+    const dancingCount = result.dancingCount || 0;
+    const personPrefix = personCount > 1 ? `👥 ${personCount}명 ` : "";
+
     if (!landmarks || !checklist.is_body_detected) {
-      this.liveStatusText.textContent = (result.personCount && result.personCount > 0)
+      this.liveStatusText.textContent = personCount > 0
         ? `${personPrefix}감지 (골반/전신이 보이도록 물러서주세요)`
         : "인물 감지 대기 중 (전신을 비춰주세요)";
     } else if (isDancing) {
       this.liveStatusBadge.classList.add("dancing");
-      this.liveStatusText.textContent = `${personPrefix}🔥 춤 감지 중! (Dancing)`;
+      if (dancingCount >= 2) {
+        this.liveStatusText.textContent = `👥 ${dancingCount}명 동시 댄스 중! 🔥`;
+      } else if (personCount > 1) {
+        this.liveStatusText.textContent = `🔥 춤 감지 중! (1/${personCount}명)`;
+      } else {
+        this.liveStatusText.textContent = `🔥 춤 감지 중! (Dancing)`;
+      }
     } else if (checklist.is_moving) {
       this.liveStatusBadge.classList.add("moving");
-      this.liveStatusText.textContent = `${personPrefix}🚶 단순 움직임 감지`;
+      this.liveStatusText.textContent = `${personPrefix}🚶 움직임 감지 (리듬/동작을 펼쳐보세요)`;
     } else {
       this.liveStatusText.textContent = `${personPrefix}🧍 정지 상태 (Idle)`;
     }
