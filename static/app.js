@@ -122,6 +122,13 @@ class DanceCheckApp {
     this.resCloseBtn.addEventListener("click", () => this.closeResultModal());
     this.resSaveBtn.addEventListener("click", () => this.saveChallengeResult());
 
+    // 화면 회전(가로/세로 전환) 감지 대응
+    window.addEventListener("orientationchange", () => {
+      setTimeout(() => {
+        if (this.isRunning) this.startCamera();
+      }, 350);
+    });
+
     // 배경 클릭 시 모달 닫기
     this.historyModal.addEventListener("click", (e) => {
       if (e.target === this.historyModal) this.closeHistoryModal();
@@ -152,12 +159,13 @@ class DanceCheckApp {
     this.poseEngine.reset();
     this.canvasCtx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
+    const isLandscape = window.innerWidth > window.innerHeight;
     const constraints = {
       audio: false,
       video: {
         facingMode: { ideal: this.currentFacingMode },
-        width: { ideal: 480, max: 640 },
-        height: { ideal: 640, max: 800 },
+        width: { ideal: isLandscape ? 640 : 480, max: isLandscape ? 800 : 640 },
+        height: { ideal: isLandscape ? 480 : 640, max: isLandscape ? 600 : 800 },
         frameRate: { ideal: 30, max: 30 }
       }
     };
@@ -278,74 +286,74 @@ class DanceCheckApp {
   }
 
   updateUI(result) {
-    const { checklist, metrics, isDancing, landmarks } = result;
+    const { checklist, metrics, isDancing, landmarks, windowMetrics } = result;
+    const wm = windowMetrics || {
+      is_dancing: isDancing,
+      avg_score: metrics.dance_score,
+      avg_energy: metrics.energy_level,
+      active_count: 0,
+      rates: { body: 0, moving: 0, rhythm: 0, dynamic: 0, sustained: 0 }
+    };
 
     // 1. FPS 배지
     this.fpsBadge.textContent = `FPS: ${metrics.fps || "--"}`;
 
-    // 2. 댄스 게이지
-    this.danceScoreText.textContent = `${metrics.dance_score}%`;
-    this.danceScoreBar.style.width = `${metrics.dance_score}%`;
+    // 2. 댄스 게이지 (3초 평균 반영)
+    this.danceScoreText.textContent = `${wm.avg_score}%`;
+    this.danceScoreBar.style.width = `${wm.avg_score}%`;
 
-    // 3. 실시간 상태 배지 (다인원 및 댄스 상태 정보 반영)
+    // 3. 실시간 판정 상태 배지 (최근 3초 롤링 윈도우 평균 기준)
     this.liveStatusBadge.className = "live-status-badge";
     const personCount = result.personCount || 0;
-    const dancingCount = result.dancingCount || 0;
     const personPrefix = personCount > 1 ? `👥 ${personCount}명 ` : "";
 
-    if (!landmarks || !checklist.is_body_detected) {
+    if (!landmarks || wm.rates.body < 40) {
       this.liveStatusText.textContent = personCount > 0
         ? `${personPrefix}감지 (골반/전신이 보이도록 물러서주세요)`
         : "인물 감지 대기 중 (전신을 비춰주세요)";
-    } else if (isDancing) {
+    } else if (wm.is_dancing) {
       this.liveStatusBadge.classList.add("dancing");
-      if (dancingCount >= 2) {
-        this.liveStatusText.textContent = `👥 ${dancingCount}명 동시 댄스 중! 🔥`;
-      } else if (personCount > 1) {
-        this.liveStatusText.textContent = `🔥 춤 감지 중! (1/${personCount}명)`;
+      if (result.dancingCount >= 2) {
+        this.liveStatusText.textContent = `👥 ${result.dancingCount}명 동시 댄스 중! 🔥 (평균 ${wm.avg_score}점)`;
       } else {
-        this.liveStatusText.textContent = `🔥 춤 감지 중! (Dancing)`;
+        this.liveStatusText.textContent = `${personPrefix}🔥 춤추는 중! (3초 평균: ${wm.avg_score}점)`;
       }
-    } else if (checklist.is_moving) {
+    } else if (wm.rates.moving >= 35) {
       this.liveStatusBadge.classList.add("moving");
-      this.liveStatusText.textContent = `${personPrefix}🚶 움직임 감지 (리듬/동작을 펼쳐보세요)`;
+      this.liveStatusText.textContent = `${personPrefix}🚶 단순 행동 중 (움직임 ${wm.rates.moving}%)`;
     } else {
-      this.liveStatusText.textContent = `${personPrefix}🧍 정지 상태 (Idle)`;
+      this.liveStatusText.textContent = `${personPrefix}🧍 정지/휴식 중 (Idle)`;
     }
 
-    // 4. 체크리스트 HUD 업데이트
-    let passedCount = 0;
+    // 4. 체크리스트 HUD 업데이트 (최근 3초 평균 충족률 반영)
+    // Body (전신 관절)
+    const bodyActive = wm.rates.body >= 50;
+    this.toggleCheckItem(this.chkItems.body, bodyActive, `${wm.rates.body}% (인식됨)`, `${wm.rates.body}% (미인식)`);
 
-    // Body
-    this.toggleCheckItem(this.chkItems.body, checklist.is_body_detected, "인식됨", "미인식");
-    if (checklist.is_body_detected) passedCount++;
+    // Moving (운동 에너지)
+    const movingActive = wm.rates.moving >= 45;
+    this.toggleCheckItem(this.chkItems.moving, movingActive, `${wm.rates.moving}% (${wm.avg_energy} E)`, `${wm.rates.moving}% (정지)`);
 
-    // Moving
-    this.toggleCheckItem(this.chkItems.moving, checklist.is_moving, `${metrics.energy_level.toFixed(1)} E`, "정지");
-    if (checklist.is_moving) passedCount++;
-
-    // Rhythm
-    const rhythmState = checklist.is_rhythmic
-      ? (metrics.bpm_estimate ? `${metrics.bpm_estimate} BPM` : "주기적")
-      : "무작위";
-    this.toggleCheckItem(this.chkItems.rhythm, checklist.is_rhythmic, rhythmState, rhythmState);
-    if (metrics.bpm_estimate && checklist.is_rhythmic) {
-      this.bpmDisplay.textContent = `비트 동기화 (${metrics.bpm_estimate} BPM 감지)`;
+    // Rhythm (리듬 주기성)
+    const rhythmActive = wm.rates.rhythm >= 40;
+    const rhythmLabel = metrics.bpm_estimate ? `${wm.rates.rhythm}% (${metrics.bpm_estimate} BPM)` : `${wm.rates.rhythm}% 비트`;
+    this.toggleCheckItem(this.chkItems.rhythm, rhythmActive, rhythmLabel, `${wm.rates.rhythm}% 무작위`);
+    if (metrics.bpm_estimate && rhythmActive) {
+      this.bpmDisplay.textContent = `비트 동기화 (${metrics.bpm_estimate} BPM, 3초 평균 ${wm.rates.rhythm}%)`;
     } else {
-      this.bpmDisplay.textContent = "주기적 비트/진동 패턴 검출";
+      this.bpmDisplay.textContent = `주기적 비트/진동 패턴 (3초 평균 ${wm.rates.rhythm}%)`;
     }
-    if (checklist.is_rhythmic) passedCount++;
 
-    // Dynamic
-    this.toggleCheckItem(this.chkItems.dynamic, checklist.is_dynamic, "충족", "제한적");
-    if (checklist.is_dynamic) passedCount++;
+    // Dynamic (가동 범위)
+    const dynamicActive = wm.rates.dynamic >= 40;
+    this.toggleCheckItem(this.chkItems.dynamic, dynamicActive, `${wm.rates.dynamic}% 충족`, `${wm.rates.dynamic}% 제한적`);
 
-    // Sustained
-    this.toggleCheckItem(this.chkItems.sustained, checklist.is_sustained, "유지됨", "부족");
-    if (checklist.is_sustained) passedCount++;
+    // Sustained (지속 시간)
+    const sustainedActive = wm.rates.sustained >= 45;
+    this.toggleCheckItem(this.chkItems.sustained, sustainedActive, `${wm.rates.sustained}% 유지됨`, `${wm.rates.sustained}% 부족`);
 
-    // 총 충족 카운터
-    this.checklistCounter.textContent = `${passedCount} / 5 충족`;
+    // 총 충족 카운터 (3초 평균 기준)
+    this.checklistCounter.textContent = `3초 평균: ${wm.active_count} / 5 충족`;
   }
 
   toggleCheckItem(item, isActive, activeText, inactiveText) {

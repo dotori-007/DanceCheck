@@ -754,3 +754,62 @@ body {
   from { opacity: 0; transform: translateY(-10px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* --------------------------------------------------------------------------
+   가로 모드(Landscape) 모바일 및 태블릿 최적화 레이아웃
+   -------------------------------------------------------------------------- */
+@media (orientation: landscape) and (min-width: 520px) {
+  body {
+    overflow-y: auto;
+  }
+
+  .app-container {
+    max-width: 100%;
+    min-height: 100vh;
+    display: grid;
+    grid-template-rows: 52px 1fr;
+    grid-template-columns: 1.25fr 1fr;
+    grid-template-areas:
+      "header header"
+      "viewport controls";
+  }
+
+  .app-header {
+    grid-area: header;
+  }
+
+  .viewport-section {
+    grid-area: viewport;
+    height: 100%;
+    padding: 10px 12px 14px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .camera-card {
+    width: 100%;
+    height: 100%;
+    max-height: calc(100vh - 76px);
+    aspect-ratio: auto; /* 세로 고정 비율 해제 */
+  }
+
+  .controls-section {
+    grid-area: controls;
+    height: 100%;
+    overflow-y: auto;
+    padding: 10px 14px 14px 8px;
+  }
+
+  .checklist-panel {
+    margin-bottom: 12px;
+  }
+
+  .checklist-items {
+    gap: 6px;
+  }
+
+  .check-item {
+    padding: 8px 12px;
+  }
+}

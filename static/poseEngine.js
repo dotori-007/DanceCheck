@@ -1,13 +1,13 @@
 /**
  * DanceCheck - poseEngine.js
  * MediaPipe Pose Landmarker Lite 기반 실시간 브라우저 AI 및 객관적 춤 판정 엔진
- * 100% 클라이언트 연산 (모바일 브라우저 최적화)
+ * 100% 클라이언트 연산 (모바일 가로/세로 모드 완벽 대응)
  * 
- * 주요 최적화:
- * 1. [FPS 극대화] CPU/GPU를 잠식하는 canvas shadowBlur 완전 제거 및 경량 듀얼 스트로크 네온 렌더링
- * 2. [다인원 독립 추적] Centroid 기반 PersonTracker로 인원별 독립 시계열(History & Energy) 버퍼 분리
- * 3. [시계열 슬라이딩 윈도우 & 댄스 래치(Latch)] 한 순간의 속도 0(정지/비트 멈춤)에도 춤 판정이 꺼지지 않도록 1.5초 유예 버퍼(Decay/Hold) 적용
- * 4. [그룹 시너지 보너스] 옆 사람이 가만히 있어도 춤추는 사람의 점수가 깎이지 않고, 함께 출 때 시너지 가산점 부여
+ * 주요 개선:
+ * 1. [1인 다중 중복 인식 차단(NMS)] 근접 중복 포즈 필터링으로 1명이 여러 명으로 뜨는 고스트 현상 제거
+ * 2. [가로모드 완벽 대응] Video Aspect Ratio 등방성 거리 계산 및 화면 회전 시 안정적 추적
+ * 3. [최근 3초 롤링 윈도우 평균 판정] 순간적 멈춤/오차에 흔들리지 않고 3초간의 체크리스트 평균 충족률 및 평균 댄스 점수로 춤 여부 확정
+ * 4. [FPS 최적화] Canvas shadowBlur 배제 및 듀얼 스트로크 초고속 렌더링 유지
  */
 
 import {
@@ -24,7 +24,7 @@ const PERSON_PALETTES = [
 ];
 
 /**
- * 인원별 독립 움직임 및 댄스 상태 추적 객체
+ * 인원별 독립 시계열 움직임 추적 클래스
  */
 class PersonTrack {
   constructor(id) {
@@ -33,7 +33,7 @@ class PersonTrack {
     this.lostFrames = 0;
 
     // 시계열 링 버퍼 (약 60프레임 = 2초)
-    this.history = []; // { timestamp, hipY, lwY, rwY, energy }
+    this.history = [];
     this.maxHistory = 60;
 
     // 관절 이전 위치
@@ -43,10 +43,10 @@ class PersonTrack {
     // 에너지 및 지속 시간
     this.instantEnergy = 0;
     this.smoothEnergy = 0;
-    this.danceHoldFrames = 0; // 춤 상태 유지 카운터 (비트 일시정지에도 유지)
-    this.sustainedDanceFrames = 0; // 누적 댄스 지속 프레임
+    this.danceHoldFrames = 0;
+    this.sustainedDanceFrames = 0;
 
-    // 평가 결과
+    // 평가 상태
     this.isBodyDetected = false;
     this.isMoving = false;
     this.isRhythmic = false;
@@ -57,7 +57,7 @@ class PersonTrack {
     this.bpm = null;
   }
 
-  update(landmarks, timestamp, head) {
+  update(landmarks, timestamp, head, aspectRatio = 1.0) {
     this.lastSeen = performance.now();
     this.lostFrames = 0;
 
@@ -65,7 +65,6 @@ class PersonTrack {
     const lh = landmarks[23], rh = landmarks[24];
     const lw = landmarks[15], rw = landmarks[16];
     const le = landmarks[13], re = landmarks[14];
-    const la = landmarks[27], ra = landmarks[28];
 
     const shoulderVis = ((ls?.visibility || 0) + (rs?.visibility || 0)) / 2;
     const hipVis = ((lh?.visibility || 0) + (rh?.visibility || 0)) / 2;
@@ -73,46 +72,45 @@ class PersonTrack {
     const shoulderCenterY = (ls && rs) ? (ls.y + rs.y) / 2 : 0;
     const hipCenterY = (lh && rh) ? (lh.y + rh.y) / 2 : 0;
     const torsoH = hipCenterY - shoulderCenterY;
-    const shoulderWidth = (ls && rs) ? Math.abs(ls.x - rs.x) : 0;
+    const shoulderWidth = (ls && rs) ? Math.abs((ls.x - rs.x) * aspectRatio) : 0;
 
-    // 얼굴/상체 클로즈업 필터링 (골반과 어깨가 모두 유효해야 함)
-    const isCloseUp = hipVis < 0.4 ||
-                      hipCenterY > 0.98 ||
-                      torsoH < 0.10 ||
-                      shoulderWidth > 0.72;
+    // 전신 코어 검출 유효성 검사 (가로/세로 모드 비율 정규화 적용)
+    // 가로 모드에서도 어깨와 골반이 보이면 정상 인식되도록 임계치 최적화
+    const isCloseUp = hipVis < 0.35 ||
+                      hipCenterY > 0.99 ||
+                      torsoH < 0.08 ||
+                      shoulderWidth > 0.85;
 
-    this.isBodyDetected = shoulderVis >= 0.50 && hipVis >= 0.40 && !isCloseUp;
+    this.isBodyDetected = shoulderVis >= 0.45 && hipVis >= 0.35 && !isCloseUp;
 
     if (!this.isBodyDetected) {
       this.instantEnergy = 0;
       this.smoothEnergy *= 0.85;
       this.danceHoldFrames = Math.max(0, this.danceHoldFrames - 2);
-      this.danceScore = Math.max(0, this.danceScore - 5);
+      this.danceScore = Math.max(0, this.danceScore - 4);
       this.isDancing = false;
       this.isMoving = false;
       return;
     }
 
-    this.torsoHeight = Math.max(0.12, torsoH);
+    this.torsoHeight = Math.max(0.10, torsoH);
     const scale = this.torsoHeight;
 
-    // 사지 및 코어 2D 변위 기반 순수 운동 에너지 계산
+    // 사지 및 코어 2D 등방성 변위 에너지 계산 (aspectRatio 적용)
     let currentEnergy = 0;
     if (this.prevJoints) {
-      const dLw = Math.hypot((lw?.x || 0) - this.prevJoints.lwX, (lw?.y || 0) - this.prevJoints.lwY) / scale;
-      const dRw = Math.hypot((rw?.x || 0) - this.prevJoints.rwX, (rw?.y || 0) - this.prevJoints.rwY) / scale;
-      const dLe = Math.hypot((le?.x || 0) - this.prevJoints.leX, (le?.y || 0) - this.prevJoints.leY) / scale;
-      const dRe = Math.hypot((re?.x || 0) - this.prevJoints.reX, (re?.y || 0) - this.prevJoints.reY) / scale;
-      const dHip = Math.hypot(((lh?.x + rh?.x)/2 || 0) - this.prevJoints.hipX, hipCenterY - this.prevJoints.hipY) / scale;
-      const dHead = head ? Math.hypot(head.x - this.prevJoints.headX, head.y - this.prevJoints.headY) / scale : 0;
+      const dLw = Math.hypot((lw?.x - this.prevJoints.lwX) * aspectRatio, (lw?.y - this.prevJoints.lwY)) / scale;
+      const dRw = Math.hypot((rw?.x - this.prevJoints.rwX) * aspectRatio, (rw?.y - this.prevJoints.rwY)) / scale;
+      const dLe = Math.hypot((le?.x - this.prevJoints.leX) * aspectRatio, (le?.y - this.prevJoints.leY)) / scale;
+      const dRe = Math.hypot((re?.x - this.prevJoints.reX) * aspectRatio, (re?.y - this.prevJoints.reY)) / scale;
+      const dHip = Math.hypot(((lh?.x + rh?.x)/2 - this.prevJoints.hipX) * aspectRatio, hipCenterY - this.prevJoints.hipY) / scale;
+      const dHead = head ? Math.hypot((head.x - this.prevJoints.headX) * aspectRatio, head.y - this.prevJoints.headY) / scale : 0;
 
-      // 손목, 팔꿈치, 골반, 머리 가중합 (급격한 클로즈업 떨림 방지)
-      currentEnergy = (dLw * 1.6 + dRw * 1.6 + dLe * 1.0 + dRe * 1.0 + dHip * 2.2 + dHead * 0.8) * 5.0;
+      currentEnergy = (dLw * 1.5 + dRw * 1.5 + dLe * 0.9 + dRe * 0.9 + dHip * 2.2 + dHead * 0.8) * 5.0;
     }
 
     this.instantEnergy = parseFloat(currentEnergy.toFixed(2));
 
-    // 이전 좌표 업데이트
     this.prevJoints = {
       lwX: lw?.x || 0, lwY: lw?.y || 0,
       rwX: rw?.x || 0, rwY: rw?.y || 0,
@@ -124,7 +122,7 @@ class PersonTrack {
       headY: head?.y || 0
     };
 
-    // 시계열 버퍼 기록
+    // 시계열 링 버퍼
     this.history.push({
       timestamp,
       hipY: hipCenterY,
@@ -136,38 +134,32 @@ class PersonTrack {
       this.history.shift();
     }
 
-    // 1. [핵심] 시계열 에너지 지수 평활 (Leaky Integrator & Peak Decay)
-    // 춤동작 중 순간 정지(Freeze, Hit)나 방향 전환 시 에너지가 0으로 급락하는 것을 방지
+    // 에너지 지수 평활 (상승 즉시 반영, 하강 부드러운 감쇄)
     if (this.instantEnergy > this.smoothEnergy) {
-      // 상승 시 빠른 반응 (85% 즉각 반영)
       this.smoothEnergy = this.smoothEnergy * 0.15 + this.instantEnergy * 0.85;
     } else {
-      // 하강 시 부드러운 감쇄 (초당 약 40% 감쇄 -> 1초간 여운 유지)
-      this.smoothEnergy = this.smoothEnergy * 0.94 + this.instantEnergy * 0.06;
+      this.smoothEnergy = this.smoothEnergy * 0.93 + this.instantEnergy * 0.07;
     }
 
-    // 2. 가동 범위 (Dynamic Range): 손목의 이동 궤적 및 팔 벌림 폭
+    // 가동 범위 (Dynamic Range, aspectRatio 적용)
     let armSpan = 0;
     if (lw && rw) {
-      armSpan = Math.hypot((lw.x - rw.x) / scale, (lw.y - rw.y) / scale);
+      armSpan = Math.hypot((lw.x - rw.x) * aspectRatio / scale, (lw.y - rw.y) / scale);
     }
-    // 손이 어깨보다 높이 올라가거나 넓게 움직이는지
     const handsHigh = (lw && ls && lw.y < ls.y) || (rw && rs && rw.y < rs.y);
-    this.isDynamic = armSpan >= 1.0 || handsHigh || this.instantEnergy >= 1.2;
+    this.isDynamic = armSpan >= 0.95 || handsHigh || this.instantEnergy >= 1.0;
 
-    // 3. 움직임 유효 판정 (단순 정지가 아님)
-    this.isMoving = this.smoothEnergy >= 0.28 || this.instantEnergy >= 0.35;
+    // 움직임 판정
+    this.isMoving = this.smoothEnergy >= 0.25 || this.instantEnergy >= 0.32;
 
-    // 4. 리듬 분석 (골반 바운스 & 손목 비트)
+    // 리듬 및 비트 주기성 판정
     const rhythm = this.evaluateRhythm();
     this.isRhythmic = rhythm.isRhythmic;
     this.bpm = rhythm.bpm;
 
-    // 5. 춤 상태 유지 래치(Hold Latch)
-    // 활발한 춤 동작(에너지 0.5 이상 또는 리듬/동적 충족)이 한 번 감지되면
-    // 최소 45프레임 (약 1.5초) 동안은 동작이 잠깐 멈춰도 춤추는 중으로 유지
-    if (this.isMoving && (this.instantEnergy >= 0.6 || this.smoothEnergy >= 0.55 || this.isRhythmic)) {
-      this.danceHoldFrames = 45; // 약 1.5초 보장
+    // 춤 상태 유지 래치
+    if (this.isMoving && (this.instantEnergy >= 0.55 || this.smoothEnergy >= 0.50 || this.isRhythmic)) {
+      this.danceHoldFrames = 45;
       this.sustainedDanceFrames = Math.min(120, this.sustainedDanceFrames + 1.5);
     } else if (this.danceHoldFrames > 0) {
       this.danceHoldFrames--;
@@ -176,46 +168,38 @@ class PersonTrack {
       this.sustainedDanceFrames = Math.max(0, this.sustainedDanceFrames - 1.5);
     }
 
-    this.isSustained = this.sustainedDanceFrames >= 30;
+    this.isSustained = this.sustainedDanceFrames >= 28;
 
-    // 6. 점수 산출 (안정적인 시계열 기반)
+    // 댄스 점수 산출
     let score = 15;
-    // 에너지 기여 (최대 45점)
-    score += Math.min(45, (this.smoothEnergy / 1.6) * 45);
-    // 동적 가동 범위 (최대 20점)
+    score += Math.min(45, (this.smoothEnergy / 1.5) * 45);
     if (this.isDynamic) score += 20;
-    // 리듬 및 주기성 (최대 20점)
     if (this.isRhythmic) score += 20;
-    // 지속성 보너스 (최대 15점)
     if (this.isSustained) score += 15;
 
-    // 움직임이 완전 정지된 경우 서서히 감쇄
     if (!this.isMoving && this.danceHoldFrames === 0) {
       score = Math.min(20, score * 0.4);
     }
 
     this.danceScore = Math.min(100, Math.round(score));
-
-    // 최종 개인 댄스 판정
     this.isDancing = this.isBodyDetected && (
       (this.danceHoldFrames > 0 && this.danceScore >= 45) ||
-      (this.danceScore >= 55 && (this.isMoving || this.isRhythmic || this.isDynamic))
+      (this.danceScore >= 52 && (this.isMoving || this.isRhythmic || this.isDynamic))
     );
   }
 
   evaluateRhythm() {
-    if (this.history.length < 25) {
+    if (this.history.length < 24) {
       return { isRhythmic: false, bpm: null };
     }
 
     const scale = this.torsoHeight || 0.2;
-    // 골반 또는 손목의 주기적 변위 신호
-    const signal = this.history.map(h => (h.hipY + (h.lwY + h.rwY) * 0.3) / scale);
+    const signal = this.history.map(h => (h.hipY + (h.lwY + h.rwY) * 0.35) / scale);
     const mean = signal.reduce((a, b) => a + b, 0) / signal.length;
     const centered = signal.map(v => v - mean);
 
     const peaks = [];
-    const minThreshold = 0.025;
+    const minThreshold = 0.022;
 
     for (let i = 2; i < centered.length - 2; i++) {
       if (centered[i] > centered[i - 1] && centered[i] > centered[i - 2] &&
@@ -238,17 +222,16 @@ class PersonTrack {
     const variance = intervals.reduce((acc, v) => acc + Math.pow(v - avgInterval, 2), 0) / intervals.length;
     const stdDev = Math.sqrt(variance);
 
-    // 30fps 기준 interval 8~32 = 56~225 BPM
-    const isIntervalValid = avgInterval >= 7 && avgInterval <= 34;
+    const isIntervalValid = avgInterval >= 7 && avgInterval <= 36;
     const regularity = Math.max(0, 1 - (stdDev / (avgInterval || 1)));
 
     let bpm = null;
     if (avgInterval > 0) {
       bpm = Math.round((30 / avgInterval) * 60);
-      if (bpm < 55 || bpm > 230) bpm = null;
+      if (bpm < 50 || bpm > 240) bpm = null;
     }
 
-    const isRhythmic = isIntervalValid && regularity >= 0.50 && peaks.length >= 3;
+    const isRhythmic = isIntervalValid && regularity >= 0.48 && peaks.length >= 3;
     return { isRhythmic, bpm: isRhythmic ? bpm : null };
   }
 }
@@ -259,14 +242,34 @@ export class PoseEngine {
     this.isReady = false;
     this.initError = null;
 
-    // MediaPipe timestamp 관리 (단조 증가 필수 보장)
+    // MediaPipe timestamp 관리
     this.lastTimestamp = -1;
 
-    // 다인원 트래킹 맵 (trackId -> PersonTrack)
+    // 인원별 독립 트랙 관리 (trackId -> PersonTrack)
     this.tracks = new Map();
     this.nextTrackId = 1;
 
-    // 통합 체크리스트 상태
+    // [핵심] 최근 3초(3000ms) 롤링 윈도우 기록 버퍼
+    this.windowDurationMs = 3000;
+    this.rollingWindow = []; // { timestamp, body, moving, rhythm, dynamic, sustained, score, energy, isDancing }
+
+    // 3초 롤링 윈도우 평균 메트릭
+    this.windowMetrics = {
+      is_dancing: false,
+      verdict_text: "인물 감지 대기 중",
+      avg_score: 0,
+      avg_energy: 0,
+      active_count: 0, // 평균 충족 항목 수 (0~5)
+      rates: {
+        body: 0,     // 0 ~ 100%
+        moving: 0,   // 0 ~ 100%
+        rhythm: 0,   // 0 ~ 100%
+        dynamic: 0,  // 0 ~ 100%
+        sustained: 0 // 0 ~ 100%
+      }
+    };
+
+    // 순간 체크리스트 상태
     this.checklist = {
       is_body_detected: false,
       is_moving: false,
@@ -291,14 +294,11 @@ export class PoseEngine {
     this.frameCount = 0;
     this.fpsTimer = performance.now();
     this.currentFps = 0;
-
-    // 전체 댄스 상태 유지 래치
-    this.globalDanceHoldTimer = 0;
   }
 
   /**
    * MediaPipe Vision 태스크 리졸버 및 PoseLandmarker 초기화
-   * 다인원 감지 (numPoses: 4) 및 안정적인 추적 컨피던스 설정
+   * confidence를 0.55로 상향하여 불필요한 유령 박스 생성 억제
    */
   async initialize() {
     const modelAssetPath = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
@@ -308,7 +308,6 @@ export class PoseEngine {
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
       );
 
-      // 다인원(numPoses: 4) 감지 및 최적화된 Tracking Confidence
       this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath,
@@ -316,9 +315,9 @@ export class PoseEngine {
         },
         runningMode: "VIDEO",
         numPoses: 4,
-        minPoseDetectionConfidence: 0.5,
-        minPosePresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5
+        minPoseDetectionConfidence: 0.55,
+        minPosePresenceConfidence: 0.55,
+        minTrackingConfidence: 0.55
       });
 
       this.isReady = true;
@@ -336,9 +335,9 @@ export class PoseEngine {
           },
           runningMode: "VIDEO",
           numPoses: 4,
-          minPoseDetectionConfidence: 0.5,
-          minPosePresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5
+          minPoseDetectionConfidence: 0.55,
+          minPosePresenceConfidence: 0.55,
+          minTrackingConfidence: 0.55
         });
         this.isReady = true;
         return true;
@@ -351,7 +350,56 @@ export class PoseEngine {
   }
 
   /**
-   * 단일 비디오 프레임 추론 및 춤 알고리즘 실행
+   * [핵심] 한 사람이 여러 명으로 중복 인식되는 현상(NMS) 필터링
+   * 동일인의 어깨/골반 중심점이 근접한 경우 더 신뢰도 높은 1개 포즈만 유지
+   */
+  filterDuplicatePoses(allPoses, aspectRatio = 1.0) {
+    if (!allPoses || allPoses.length <= 1) return allPoses || [];
+
+    const filtered = [];
+    const duplicateThreshold = 0.18; // 동일 인물 중심점 판별 거리
+
+    for (const pose of allPoses) {
+      const ls = pose[11], rs = pose[12], lh = pose[23], rh = pose[24];
+      if (!ls || !rs) continue;
+
+      const neckX = (ls.x + rs.x) / 2;
+      const neckY = (ls.y + rs.y) / 2;
+      const hipX = (lh && rh) ? (lh.x + rh.x) / 2 : neckX;
+      const hipY = (lh && rh) ? (lh.y + rh.y) / 2 : neckY + 0.3;
+      const cx = (neckX + hipX) / 2;
+      const cy = (neckY + hipY) / 2;
+
+      // 이미 채택된 포즈들과 비교
+      let isDuplicate = false;
+      for (const accepted of filtered) {
+        const a_ls = accepted[11], a_rs = accepted[12], a_lh = accepted[23], a_rh = accepted[24];
+        const a_neckX = (a_ls.x + a_rs.x) / 2;
+        const a_neckY = (a_ls.y + a_rs.y) / 2;
+        const a_hipX = (a_lh && a_rh) ? (a_lh.x + a_rh.x) / 2 : a_neckX;
+        const a_hipY = (a_lh && a_rh) ? (a_lh.y + a_rh.y) / 2 : a_neckY + 0.3;
+        const a_cx = (a_neckX + a_hipX) / 2;
+        const a_cy = (a_neckY + a_hipY) / 2;
+
+        const dist = Math.hypot((cx - a_cx) * aspectRatio, cy - a_cy);
+        const neckDist = Math.hypot((neckX - a_neckX) * aspectRatio, neckY - a_neckY);
+
+        if (dist < duplicateThreshold || neckDist < 0.14) {
+          isDuplicate = true;
+          break;
+        }
+      }
+
+      if (!isDuplicate) {
+        filtered.push(pose);
+      }
+    }
+
+    return filtered;
+  }
+
+  /**
+   * 단일 비디오 프레임 추론 및 3초 롤링 윈도우 종합 평가
    */
   processFrame(videoElement, timestamp) {
     if (!this.isReady || !this.poseLandmarker) {
@@ -386,37 +434,143 @@ export class PoseEngine {
       return null;
     }
 
-    const allPoses = results?.landmarks || [];
-    this.metrics.person_count = allPoses.length;
+    // 가로/세로 비율 계산
+    const aspectRatio = (videoElement.videoWidth || 640) / (videoElement.videoHeight || 480);
 
-    // 다인원 트래킹 매칭 및 시계열 댄스 분석
-    const evaluation = this.updateMultiPersonTracking(allPoses, safeTimestamp);
+    // 1. 중복 인식 포즈 제거 (1인 다중 인식 차단)
+    const rawPoses = results?.landmarks || [];
+    const distinctPoses = this.filterDuplicatePoses(rawPoses, aspectRatio);
+    this.metrics.person_count = distinctPoses.length;
+
+    // 2. 인원별 독립 트래킹 및 순간 평가
+    const instantEval = this.updateMultiPersonTracking(distinctPoses, safeTimestamp, aspectRatio);
+
+    // 3. [핵심] 최근 3초 롤링 윈도우 기록 및 평균 계산
+    this.update3SecondRollingWindow(safeTimestamp, instantEval);
 
     return {
-      allLandmarks: allPoses,
-      landmarks: allPoses[0] || null,
-      personCount: allPoses.length,
-      dancingCount: evaluation.dancingCount,
+      allLandmarks: distinctPoses,
+      landmarks: distinctPoses[0] || null,
+      personCount: distinctPoses.length,
+      dancingCount: instantEval.dancingCount,
       checklist: { ...this.checklist },
+      windowMetrics: { ...this.windowMetrics },
       metrics: {
         ...this.metrics,
+        dance_score: this.windowMetrics.avg_score, // 3초 평균 점수 반영
         fps: this.currentFps
       },
-      isDancing: evaluation.isDancing
+      isDancing: this.windowMetrics.is_dancing
     };
   }
 
   /**
-   * 인원별 Centroid 기반 트래킹 매칭 및 통합 평가
+   * [핵심] 최근 3초 롤링 윈도우 평균 계산 및 화면 판정 결정
    */
-  updateMultiPersonTracking(allPoses, timestamp) {
-    if (!allPoses || allPoses.length === 0) {
+  update3SecondRollingWindow(timestamp, instantEval) {
+    // 현재 프레임 상태 버퍼에 추가
+    this.rollingWindow.push({
+      timestamp,
+      body: this.checklist.is_body_detected,
+      moving: this.checklist.is_moving,
+      rhythm: this.checklist.is_rhythmic,
+      dynamic: this.checklist.is_dynamic,
+      sustained: this.checklist.is_sustained,
+      score: this.metrics.dance_score,
+      energy: this.metrics.energy_level,
+      isDancing: instantEval.isDancing
+    });
+
+    // 3초(3000ms) 이전 과거 데이터 제거
+    const cutoff = timestamp - this.windowDurationMs;
+    while (this.rollingWindow.length > 0 && this.rollingWindow[0].timestamp < cutoff) {
+      this.rollingWindow.shift();
+    }
+
+    const total = this.rollingWindow.length;
+    if (total === 0) {
+      this.windowMetrics = {
+        is_dancing: false,
+        verdict_text: "인물 감지 대기 중",
+        avg_score: 0,
+        avg_energy: 0,
+        active_count: 0,
+        rates: { body: 0, moving: 0, rhythm: 0, dynamic: 0, sustained: 0 }
+      };
+      return;
+    }
+
+    // 3초간 각 항목별 충족 비율(%) 계산
+    const bodyCount = this.rollingWindow.filter(w => w.body).length;
+    const movingCount = this.rollingWindow.filter(w => w.moving).length;
+    const rhythmCount = this.rollingWindow.filter(w => w.rhythm).length;
+    const dynamicCount = this.rollingWindow.filter(w => w.dynamic).length;
+    const sustainedCount = this.rollingWindow.filter(w => w.sustained).length;
+
+    const rates = {
+      body: Math.round((bodyCount / total) * 100),
+      moving: Math.round((movingCount / total) * 100),
+      rhythm: Math.round((rhythmCount / total) * 100),
+      dynamic: Math.round((dynamicCount / total) * 100),
+      sustained: Math.round((sustainedCount / total) * 100)
+    };
+
+    // 3초 평균 점수 및 평균 에너지
+    const avgScore = Math.round(
+      this.rollingWindow.reduce((acc, w) => acc + w.score, 0) / total
+    );
+    const avgEnergy = parseFloat(
+      (this.rollingWindow.reduce((acc, w) => acc + w.energy, 0) / total).toFixed(2)
+    );
+
+    // 3초 평균 기준 충족 항목 수 (충족률 45% 이상인 항목 수)
+    let activeCount = 0;
+    if (rates.body >= 50) activeCount++;
+    if (rates.moving >= 45) activeCount++;
+    if (rates.rhythm >= 40) activeCount++;
+    if (rates.dynamic >= 40) activeCount++;
+    if (rates.sustained >= 45) activeCount++;
+
+    // 3초 평균 기준 종합 춤 여부 판정
+    // 순간 멈춤(Freeze)이 있어도 3초 평균 댄스 점수가 50 이상이고 동작/리듬이 유지되면 '춤추는 중' 확정!
+    const isDancingWindow = rates.body >= 40 &&
+      avgScore >= 48 &&
+      rates.moving >= 40 &&
+      (rates.rhythm >= 35 || rates.dynamic >= 35 || rates.sustained >= 40);
+
+    let verdictText = "🧍 정지 상태 (Idle)";
+    if (rates.body < 40) {
+      verdictText = "전신 인식 필요 (뒤로 물러서주세요)";
+    } else if (isDancingWindow) {
+      if (this.metrics.dancing_person_count >= 2) {
+        verdictText = `👥 ${this.metrics.dancing_person_count}명 동시 댄스 중! 🔥`;
+      } else {
+        verdictText = `🔥 춤 감지 중! (Dancing)`;
+      }
+    } else if (rates.moving >= 35) {
+      verdictText = "🚶 단순 행동/움직임 중";
+    }
+
+    this.windowMetrics = {
+      is_dancing: isDancingWindow,
+      verdict_text: verdictText,
+      avg_score: avgScore,
+      avg_energy: avgEnergy,
+      active_count: activeCount,
+      rates
+    };
+  }
+
+  /**
+   * 다인원 트래킹 매칭 및 프레임 순간 평가
+   */
+  updateMultiPersonTracking(distinctPoses, timestamp, aspectRatio) {
+    if (!distinctPoses || distinctPoses.length === 0) {
       this.resetEvaluationState();
       return { isDancing: false, dancingCount: 0 };
     }
 
-    // 현재 프레임 각 포즈의 중심점(어깨+골반) 계산
-    const currentPosesData = allPoses.map((landmarks, index) => {
+    const currentPosesData = distinctPoses.map((landmarks, index) => {
       const head = this.getHeadPoint(landmarks);
       const ls = landmarks[11], rs = landmarks[12];
       const lh = landmarks[23], rh = landmarks[24];
@@ -425,19 +579,18 @@ export class PoseEngine {
       return { index, landmarks, head, cx, cy, matchedTrack: null };
     });
 
-    // 기존 트랙들과 최소 거리 매칭 (Centroid 거리 < 0.35)
     const activeTracks = Array.from(this.tracks.values());
     const matchedTrackIds = new Set();
 
     for (const poseData of currentPosesData) {
       let closestTrack = null;
-      let minDistance = 0.35; // 허용 반경
+      let minDistance = 0.35;
 
       for (const track of activeTracks) {
         if (matchedTrackIds.has(track.id)) continue;
         if (!track.prevJoints) continue;
 
-        const dist = Math.hypot(poseData.cx - track.prevJoints.hipX, poseData.cy - track.prevJoints.hipY);
+        const dist = Math.hypot((poseData.cx - track.prevJoints.hipX) * aspectRatio, poseData.cy - track.prevJoints.hipY);
         if (dist < minDistance) {
           minDistance = dist;
           closestTrack = track;
@@ -446,19 +599,17 @@ export class PoseEngine {
 
       if (closestTrack) {
         matchedTrackIds.add(closestTrack.id);
-        closestTrack.update(poseData.landmarks, timestamp, poseData.head);
+        closestTrack.update(poseData.landmarks, timestamp, poseData.head, aspectRatio);
         poseData.matchedTrack = closestTrack;
       } else {
-        // 새 트랙 생성
         const newTrack = new PersonTrack(this.nextTrackId++);
-        newTrack.update(poseData.landmarks, timestamp, poseData.head);
+        newTrack.update(poseData.landmarks, timestamp, poseData.head, aspectRatio);
         this.tracks.set(newTrack.id, newTrack);
         matchedTrackIds.add(newTrack.id);
         poseData.matchedTrack = newTrack;
       }
     }
 
-    // 매칭되지 않은 오래된 트랙 정리 (1초 이상 미검출 시 삭제)
     const now = performance.now();
     for (const [id, track] of this.tracks.entries()) {
       if (!matchedTrackIds.has(id)) {
@@ -469,7 +620,6 @@ export class PoseEngine {
       }
     }
 
-    // 유효한 신체(전신/코어)를 가진 활성 트랙 추출
     const validTracks = currentPosesData
       .map(p => p.matchedTrack)
       .filter(t => t && t.isBodyDetected);
@@ -479,57 +629,37 @@ export class PoseEngine {
       return { isDancing: false, dancingCount: 0 };
     }
 
-    // 가장 활발히 춤추는 메인 댄서 선정
     validTracks.sort((a, b) => b.danceScore - a.danceScore);
     const primary = validTracks[0];
 
-    // 춤추는 중인 인원 수 카운트
     const dancingTracks = validTracks.filter(t => t.isDancing);
     const dancingCount = dancingTracks.length;
     this.metrics.dancing_person_count = dancingCount;
 
-    // 그룹 시너지 보너스: 2명 이상이 함께 춤출 때 가산점 부여 (옆 사람이 가만히 있어도 감점 안 됨!)
     let combinedScore = primary.danceScore;
     if (dancingCount >= 2) {
       const synergyBonus = Math.min(15, (dancingCount - 1) * 6);
       combinedScore = Math.min(100, combinedScore + synergyBonus);
     }
 
-    // 통합 체크리스트 반영
+    // 순간 체크리스트
     this.checklist.is_body_detected = true;
     this.checklist.is_moving = validTracks.some(t => t.isMoving);
     this.checklist.is_rhythmic = validTracks.some(t => t.isRhythmic);
     this.checklist.is_dynamic = validTracks.some(t => t.isDynamic);
     this.checklist.is_sustained = validTracks.some(t => t.isSustained);
 
-    // 메트릭 반영
     this.metrics.energy_level = parseFloat(primary.smoothEnergy.toFixed(2));
     this.metrics.bpm_estimate = primary.bpm || (dancingTracks.find(t => t.bpm)?.bpm) || null;
     this.metrics.periodicity_score = this.checklist.is_rhythmic ? 0.85 : 0.2;
+    this.metrics.dance_score = combinedScore;
 
-    // 점수 평활
-    this.metrics.dance_score = Math.round(
-      this.metrics.dance_score * 0.4 + combinedScore * 0.6
-    );
-
-    // 전체 춤 판정: 최소 1명 이상이 춤을 추고 있거나, 유예 래치가 살아있을 때
-    let isOverallDancing = dancingCount > 0 || (this.metrics.dance_score >= 50 && this.checklist.is_moving);
-
-    if (isOverallDancing) {
-      this.globalDanceHoldTimer = 35; // 약 1.2초간 전체 춤 상태 유지
-    } else if (this.globalDanceHoldTimer > 0) {
-      this.globalDanceHoldTimer--;
-      isOverallDancing = true;
-    }
-
-    return {
-      isDancing: Boolean(isOverallDancing),
-      dancingCount
-    };
+    const isDancing = dancingCount > 0 || (combinedScore >= 50 && this.checklist.is_moving);
+    return { isDancing, dancingCount };
   }
 
   /**
-   * 얼굴 세부 포인트(0~10)를 제거하고 머리(Head) 단일 중심 좌표 계산
+   * 얼굴 세부 포인트(0~10) 제거 및 단일 머리 중심점 계산
    */
   getHeadPoint(landmarks) {
     if (!landmarks) return null;
@@ -560,7 +690,7 @@ export class PoseEngine {
   }
 
   /**
-   * 다인원 랜드마크 초고속 렌더링 (shadowBlur 완전 제거로 모바일 30+ FPS 보장)
+   * 스켈레톤 초고속 렌더링 (가로/세로 비율 자동 정합)
    */
   drawLandmarks(canvasCtx, allLandmarks, width, height) {
     if (!canvasCtx) return;
@@ -573,29 +703,22 @@ export class PoseEngine {
       return;
     }
 
-    // 신체 관절 연결선 (얼굴 내부 0~10 제외, 순수 몸통/사지)
     const bodyConnections = [
-      [11, 12], // 어깨 사이
-      [11, 13], [13, 15], // 왼팔
-      [12, 14], [14, 16], // 오른팔
-      [11, 23], [12, 24], [23, 24], // 몸통
-      [23, 25], [25, 27], // 왼다리
-      [24, 26], [26, 28]  // 오른다리
+      [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+      [11, 23], [12, 24], [23, 24],
+      [23, 25], [25, 27], [24, 26], [26, 28]
     ];
 
     allLandmarks.forEach((landmarks, pIdx) => {
       const palette = PERSON_PALETTES[pIdx % PERSON_PALETTES.length];
       const head = this.getHeadPoint(landmarks);
 
-      // 1. 머리 -> 목 척추 연결선 (2패스 경량 네온)
+      // 1. 머리 -> 목 척추 라인
       if (head && head.visibility > 0.35) {
-        const hx = head.x * width;
-        const hy = head.y * height;
-        const nx = head.neckX * width;
-        const ny = head.neckY * height;
+        const hx = head.x * width, hy = head.y * height;
+        const nx = head.neckX * width, ny = head.neckY * height;
 
-        // 글로우 효과를 shadowBlur 대신 반투명 두꺼운 선으로 대체 (CPU/GPU 부하 0)
-        canvasCtx.lineWidth = 6;
+        canvasCtx.lineWidth = 5;
         canvasCtx.strokeStyle = palette.glowLine;
         canvasCtx.beginPath();
         canvasCtx.moveTo(hx, hy);
@@ -610,8 +733,7 @@ export class PoseEngine {
         canvasCtx.stroke();
       }
 
-      // 2. 스켈레톤 선 그리기 (2패스 경량 네온 렌더링)
-      // 패스 1: 반투명 글로우 외곽선
+      // 2. 스켈레톤 뼈대
       canvasCtx.lineWidth = 5;
       canvasCtx.strokeStyle = palette.glowLine;
       canvasCtx.beginPath();
@@ -624,7 +746,6 @@ export class PoseEngine {
       }
       canvasCtx.stroke();
 
-      // 패스 2: 선명한 중심 네온 라인
       canvasCtx.lineWidth = 2.5;
       canvasCtx.strokeStyle = palette.stroke;
       canvasCtx.beginPath();
@@ -637,26 +758,21 @@ export class PoseEngine {
       }
       canvasCtx.stroke();
 
-      // 3. 주요 관절 포인트 렌더링 (단일 패스 솔리드 원)
+      // 3. 주요 관절
       for (let i = 11; i < landmarks.length; i++) {
         if (![11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28].includes(i)) continue;
 
         const lm = landmarks[i];
         if ((lm.visibility || 0) > 0.35) {
-          const x = lm.x * width;
-          const y = lm.y * height;
-
+          const x = lm.x * width, y = lm.y * height;
           canvasCtx.beginPath();
           if ([15, 16, 27, 28].includes(i)) {
-            // 손목/발목 포인트
             canvasCtx.fillStyle = palette.joint;
             canvasCtx.arc(x, y, 5, 0, 2 * Math.PI);
           } else if ([11, 12, 23, 24].includes(i)) {
-            // 코어 어깨/골반 포인트
             canvasCtx.fillStyle = palette.core;
             canvasCtx.arc(x, y, 4.5, 0, 2 * Math.PI);
           } else {
-            // 팔꿈치/무릎
             canvasCtx.fillStyle = palette.head;
             canvasCtx.arc(x, y, 3.5, 0, 2 * Math.PI);
           }
@@ -664,30 +780,25 @@ export class PoseEngine {
         }
       }
 
-      // 4. 단일 머리(Head) 포인트 원형 렌더링 (얼굴 디테일 대체)
+      // 4. 머리 단일 노드 렌더링
       if (head && head.visibility > 0.35) {
-        const hx = head.x * width;
-        const hy = head.y * height;
+        const hx = head.x * width, hy = head.y * height;
 
-        // 머리 외곽 링
         canvasCtx.beginPath();
         canvasCtx.fillStyle = palette.glowLine;
         canvasCtx.arc(hx, hy, 12, 0, 2 * Math.PI);
         canvasCtx.fill();
 
-        // 머리 중심 원
         canvasCtx.beginPath();
         canvasCtx.fillStyle = palette.head;
         canvasCtx.arc(hx, hy, 8, 0, 2 * Math.PI);
         canvasCtx.fill();
 
-        // 머리 내부 화이트 코어 닷
         canvasCtx.beginPath();
         canvasCtx.fillStyle = "#ffffff";
         canvasCtx.arc(hx, hy, 3, 0, 2 * Math.PI);
         canvasCtx.fill();
 
-        // 다인원일 때 인원 번호 배지 표시 (P1, P2 ...)
         if (allLandmarks.length > 1) {
           canvasCtx.font = "bold 11px Pretendard, sans-serif";
           canvasCtx.fillStyle = "#ffffff";
@@ -700,17 +811,14 @@ export class PoseEngine {
     canvasCtx.restore();
   }
 
-  /**
-   * 평가 상태 초기화
-   */
   resetEvaluationState() {
     this.checklist.is_body_detected = false;
     this.checklist.is_moving = false;
     this.checklist.is_rhythmic = false;
     this.checklist.is_dynamic = false;
     this.checklist.is_sustained = false;
-    this.metrics.dance_score = Math.max(0, this.metrics.dance_score - 5);
-    this.metrics.energy_level = Math.max(0, this.metrics.energy_level * 0.8);
+    this.metrics.dance_score = 0;
+    this.metrics.energy_level = 0;
     this.metrics.bpm_estimate = null;
     this.metrics.periodicity_score = 0;
     this.metrics.dancing_person_count = 0;
@@ -718,21 +826,17 @@ export class PoseEngine {
 
   reset() {
     this.tracks.clear();
+    this.rollingWindow = [];
     this.nextTrackId = 1;
     this.lastTimestamp = -1;
-    this.globalDanceHoldTimer = 0;
-    this.metrics.dance_score = 0;
-    this.metrics.energy_level = 0;
-    this.metrics.bpm_estimate = null;
-    this.metrics.periodicity_score = 0;
-    this.metrics.person_count = 0;
-    this.metrics.dancing_person_count = 0;
-    this.checklist = {
-      is_body_detected: false,
-      is_moving: false,
-      is_rhythmic: false,
-      is_dynamic: false,
-      is_sustained: false
+    this.resetEvaluationState();
+    this.windowMetrics = {
+      is_dancing: false,
+      verdict_text: "인물 감지 대기 중",
+      avg_score: 0,
+      avg_energy: 0,
+      active_count: 0,
+      rates: { body: 0, moving: 0, rhythm: 0, dynamic: 0, sustained: 0 }
     };
   }
 }
