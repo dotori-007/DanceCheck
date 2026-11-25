@@ -259,10 +259,10 @@ class DanceCheckApp {
 
     this.lastProcessedResult = result;
 
-    // 스켈레톤 랜드마크 드로잉
+    // 스켈레톤 랜드마크 드로잉 (다인원 지원)
     this.poseEngine.drawLandmarks(
       this.canvasCtx,
-      result.landmarks,
+      result.allLandmarks,
       this.canvas.width,
       this.canvas.height
     );
@@ -286,18 +286,21 @@ class DanceCheckApp {
     this.danceScoreText.textContent = `${metrics.dance_score}%`;
     this.danceScoreBar.style.width = `${metrics.dance_score}%`;
 
-    // 3. 실시간 상태 배지
+    // 3. 실시간 상태 배지 (다인원 정보 반영)
     this.liveStatusBadge.className = "live-status-badge";
+    const personPrefix = (result.personCount && result.personCount > 1) ? `👥 ${result.personCount}명 ` : "";
     if (!landmarks || !checklist.is_body_detected) {
-      this.liveStatusText.textContent = "전신/골반 감지 대기 중 (뒤로 물러서주세요)";
+      this.liveStatusText.textContent = (result.personCount && result.personCount > 0)
+        ? `${personPrefix}감지 (골반/전신이 보이도록 물러서주세요)`
+        : "인물 감지 대기 중 (전신을 비춰주세요)";
     } else if (isDancing) {
       this.liveStatusBadge.classList.add("dancing");
-      this.liveStatusText.textContent = "🔥 춤 감지 중! (Dancing)";
+      this.liveStatusText.textContent = `${personPrefix}🔥 춤 감지 중! (Dancing)`;
     } else if (checklist.is_moving) {
       this.liveStatusBadge.classList.add("moving");
-      this.liveStatusText.textContent = "🚶 단순 움직임 감지";
+      this.liveStatusText.textContent = `${personPrefix}🚶 단순 움직임 감지`;
     } else {
-      this.liveStatusText.textContent = "🧍 정지 상태 (Idle)";
+      this.liveStatusText.textContent = `${personPrefix}🧍 정지 상태 (Idle)`;
     }
 
     // 4. 체크리스트 HUD 업데이트
@@ -418,7 +421,8 @@ class DanceCheckApp {
         bpm_estimate: avgBpm,
         periodicity_score: parseFloat((avgScore / 100).toFixed(2)),
         analysis_duration_sec: 7.0,
-        fps: this.lastProcessedResult?.metrics?.fps || 30
+        fps: this.lastProcessedResult?.metrics?.fps || 30,
+        person_count: this.lastProcessedResult?.metrics?.person_count || 1
       },
       notes: isDancingFinal ? "7초 댄스 챌린지 성공 (리듬 및 모션 기준 충족)" : "움직임 또는 리듬감 부족으로 댄스 미충족"
     };
@@ -465,7 +469,8 @@ class DanceCheckApp {
         bpm_estimate: metrics.bpm_estimate,
         periodicity_score: metrics.periodicity_score,
         analysis_duration_sec: 2.0,
-        fps: metrics.fps
+        fps: metrics.fps,
+        person_count: metrics.person_count || 1
       },
       notes: isDancing ? "실시간 스냅샷: 춤 판정" : "실시간 스냅샷: 춤 아님",
       user_agent: navigator.userAgent

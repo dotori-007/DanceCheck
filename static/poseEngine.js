@@ -2,18 +2,26 @@
  * DanceCheck - poseEngine.js
  * MediaPipe Pose Landmarker Lite 기반 실시간 브라우저 AI 및 객관적 춤 판정 엔진
  * 100% 클라이언트 연산 (모바일 브라우저 최적화)
+ * - 다인원(Multi-person) 감지 지원 (최대 4인)
+ * - 얼굴 포인트 제거 & 단일 머리(Head) 포인트 통합 렌더링/측정
  */
 
 import {
   PoseLandmarker,
-  FilesetResolver,
-  DrawingUtils
+  FilesetResolver
 } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// 다인원 스켈레톤 색상 테마 팔레트 (Cyberpunk Neon)
+const PERSON_PALETTES = [
+  { stroke: "rgba(0, 240, 255, 0.8)", glow: "#00f0ff", head: "#00ffff", joint: "#ff007f", core: "#ffe600" },
+  { stroke: "rgba(57, 255, 20, 0.8)", glow: "#39ff14", head: "#39ff14", joint: "#ffe600", core: "#00f0ff" },
+  { stroke: "rgba(255, 0, 127, 0.8)", glow: "#ff007f", head: "#ff007f", joint: "#00f0ff", core: "#ffe600" },
+  { stroke: "rgba(255, 170, 0, 0.8)", glow: "#ffaa00", head: "#ffaa00", joint: "#39ff14", core: "#ff007f" }
+];
 
 export class PoseEngine {
   constructor() {
     this.poseLandmarker = null;
-    this.drawingUtils = null;
     this.isReady = false;
     this.initError = null;
 
@@ -22,7 +30,7 @@ export class PoseEngine {
 
     // 시계열 분석을 위한 링 버퍼 (약 90프레임 = 30fps 기준 3초)
     this.bufferSize = 90;
-    this.history = []; // { timestamp, landmarks, energy, hipY, torsoHeight }
+    this.history = []; // { timestamp, landmarks, energy, hipY, torsoHeight, headY }
 
     // 체크리스트 상태
     this.checklist = {
@@ -40,7 +48,8 @@ export class PoseEngine {
       bpm_estimate: null,
       periodicity_score: 0,
       analysis_duration_sec: 0,
-      fps: 0
+      fps: 0,
+      person_count: 0
     };
 
     // FPS 계산
@@ -55,30 +64,28 @@ export class PoseEngine {
 
   /**
    * MediaPipe Vision 태스크 리졸버 및 PoseLandmarker 초기화
+   * 다인원 감지 (numPoses: 4) 지원
    */
-  async initialize(canvasElement) {
+  async initialize() {
+    const modelAssetPath = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
     try {
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
       );
 
-      // 모바일 친화적인 lite 모델과 GPU 델리게이트 사용
+      // 다인원(numPoses: 4) 감지 및 GPU 델리게이트
       this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: {
-          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+          modelAssetPath,
           delegate: "GPU"
         },
         runningMode: "VIDEO",
-        numPoses: 1,
-        minPoseDetectionConfidence: 0.5,
-        minPosePresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5
+        numPoses: 4,
+        minPoseDetectionConfidence: 0.45,
+        minPosePresenceConfidence: 0.45,
+        minTrackingConfidence: 0.45
       });
-
-      if (canvasElement) {
-        const ctx = canvasElement.getContext("2d");
-        this.drawingUtils = new DrawingUtils(ctx);
-      }
 
       this.isReady = true;
       return true;
@@ -90,16 +97,12 @@ export class PoseEngine {
         );
         this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
           baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+            modelAssetPath,
             delegate: "CPU"
           },
           runningMode: "VIDEO",
-          numPoses: 1
+          numPoses: 4
         });
-        if (canvasElement) {
-          const ctx = canvasElement.getContext("2d");
-          this.drawingUtils = new DrawingUtils(ctx);
-        }
         this.isReady = true;
         return true;
       } catch (fallbackErr) {
@@ -112,16 +115,12 @@ export class PoseEngine {
 
   /**
    * 단일 비디오 프레임 추론 및 춤 알고리즘 실행
-   * @param {HTMLVideoElement} videoElement
-   * @param {number} timestamp
-   * @returns {Object} { landmarks, checklist, metrics, isDancing }
    */
   processFrame(videoElement, timestamp) {
     if (!this.isReady || !this.poseLandmarker) {
       return null;
     }
 
-    // 비디오 해상도가 아직 준비되지 않았으면 안전하게 스킵
     if (!videoElement || videoElement.videoWidth === 0 || videoElement.videoHeight === 0) {
       return null;
     }
@@ -135,7 +134,7 @@ export class PoseEngine {
       this.fpsTimer = now;
     }
 
-    // MediaPipe는 timestamp가 반드시 엄격하게 단조 증가(strictly increasing)해야 함
+    // MediaPipe timestamp 단조 증가 보장
     let safeTimestamp = timestamp;
     if (safeTimestamp <= this.lastTimestamp) {
       safeTimestamp = this.lastTimestamp + 1;
@@ -150,14 +149,12 @@ export class PoseEngine {
       return null;
     }
 
-    const hasPose = results && results.landmarks && results.landmarks.length > 0;
-    let currentLandmarks = null;
-    if (hasPose) {
-      currentLandmarks = results.landmarks[0];
-    }
+    const allPoses = results?.landmarks || [];
+    const personCount = allPoses.length;
+    this.metrics.person_count = personCount;
 
-    // 춤 판정 및 체크리스트 계산
-    this.evaluateDanceMotion(currentLandmarks, safeTimestamp);
+    // 감지된 인원 전체 춤 판정 및 분석
+    this.evaluateMultiPersonDance(allPoses, safeTimestamp);
 
     const isDancing = this.metrics.dance_score >= 60 &&
       this.checklist.is_body_detected &&
@@ -165,7 +162,9 @@ export class PoseEngine {
       (this.checklist.is_rhythmic || this.checklist.is_dynamic);
 
     return {
-      landmarks: currentLandmarks,
+      allLandmarks: allPoses,
+      landmarks: allPoses[0] || null, // 대표 랜드마크
+      personCount,
       checklist: { ...this.checklist },
       metrics: {
         ...this.metrics,
@@ -176,252 +175,325 @@ export class PoseEngine {
   }
 
   /**
-   * 포즈 랜드마크 렌더링
+   * 얼굴 세부 포인트(0~10)를 제거하고 머리(Head) 단일 중심 좌표 계산
    */
-  drawLandmarks(canvasCtx, landmarks, width, height) {
-    if (!landmarks || !canvasCtx) return;
+  getHeadPoint(landmarks) {
+    if (!landmarks) return null;
+
+    const nose = landmarks[0];
+    const earL = landmarks[7], earR = landmarks[8];
+    const ls = landmarks[11], rs = landmarks[12];
+
+    const neckX = (ls && rs) ? (ls.x + rs.x) / 2 : (nose?.x || 0.5);
+    const neckY = (ls && rs) ? (ls.y + rs.y) / 2 : 0.3;
+
+    let headX = neckX;
+    let headY = neckY - 0.12; // 기본 오프셋
+    let visibility = 0.5;
+
+    // 양 귀가 감지되면 귀의 중간점을 머리 중심으로 사용
+    if (earL && earR && (earL.visibility || 0) > 0.3 && (earR.visibility || 0) > 0.3) {
+      headX = (earL.x + earR.x) / 2;
+      headY = (earL.y + earR.y) / 2;
+      visibility = (earL.visibility + earR.visibility) / 2;
+    } else if (nose && (nose.visibility || 0) > 0.3) {
+      headX = nose.x;
+      // 코에서 위쪽으로 살짝 올려서 정수리/머리 중심점 형성
+      const headOffset = Math.max(0.04, Math.abs(neckY - nose.y) * 0.4);
+      headY = nose.y - headOffset;
+      visibility = nose.visibility || 0.5;
+    }
+
+    return { x: headX, y: headY, visibility, neckX, neckY };
+  }
+
+  /**
+   * 다인원 랜드마크 렌더링 (얼굴 디테일 제외, 단일 머리 포인트 & 깔끔한 스켈레톤)
+   */
+  drawLandmarks(canvasCtx, allLandmarks, width, height) {
+    if (!canvasCtx) return;
 
     canvasCtx.save();
     canvasCtx.clearRect(0, 0, width, height);
 
-    // 관절 연결선 정의
-    const connections = PoseLandmarker.POSE_CONNECTIONS;
+    if (!allLandmarks || allLandmarks.length === 0) {
+      canvasCtx.restore();
+      return;
+    }
 
-    // 네온 스타일 스켈레톤 선 그리기
-    canvasCtx.lineWidth = 3;
-    canvasCtx.strokeStyle = "rgba(0, 240, 255, 0.75)";
-    canvasCtx.shadowColor = "#00f0ff";
-    canvasCtx.shadowBlur = 8;
+    // 신체 관절 연결선 (얼굴 내부 0~10 제외, 순수 몸통/사지)
+    const bodyConnections = [
+      // 상체 및 팔
+      [11, 12], // 어깨 사이
+      [11, 13], [13, 15], // 왼팔
+      [12, 14], [14, 16], // 오른팔
+      // 몸통
+      [11, 23], [12, 24], [23, 24], // 어깨-골반 및 골반 사이
+      // 하체 및 다리
+      [23, 25], [25, 27], // 왼다리
+      [24, 26], [26, 28]  // 오른다리
+    ];
 
-    for (const conn of connections) {
-      const p1 = landmarks[conn.start];
-      const p2 = landmarks[conn.end];
-      if (p1 && p2 && (p1.visibility || 1) > 0.4 && (p2.visibility || 1) > 0.4) {
+    // 감지된 각 인원별 렌더링
+    allLandmarks.forEach((landmarks, pIdx) => {
+      const palette = PERSON_PALETTES[pIdx % PERSON_PALETTES.length];
+      const head = this.getHeadPoint(landmarks);
+
+      // 1. 머리 -> 목(어깨 중심) 척추 연결선 그리기
+      if (head && head.visibility > 0.35) {
+        canvasCtx.lineWidth = 3.5;
+        canvasCtx.strokeStyle = palette.stroke;
+        canvasCtx.shadowColor = palette.glow;
+        canvasCtx.shadowBlur = 8;
+
         canvasCtx.beginPath();
-        canvasCtx.moveTo(p1.x * width, p1.y * height);
-        canvasCtx.lineTo(p2.x * width, p2.y * height);
+        canvasCtx.moveTo(head.x * width, head.y * height);
+        canvasCtx.lineTo(head.neckX * width, head.neckY * height);
         canvasCtx.stroke();
       }
-    }
 
-    // 관절 포인트 그리기
-    for (let i = 0; i < landmarks.length; i++) {
-      const lm = landmarks[i];
-      if ((lm.visibility || 1) > 0.4) {
-        const x = lm.x * width;
-        const y = lm.y * height;
+      // 2. 몸통 및 사지 스켈레톤 선 그리기
+      canvasCtx.lineWidth = 3;
+      canvasCtx.strokeStyle = palette.stroke;
+      canvasCtx.shadowColor = palette.glow;
+      canvasCtx.shadowBlur = 6;
 
-        canvasCtx.beginPath();
-        // 손목/발목/골반 등 주요 포인트 강조
-        if ([15, 16, 27, 28].includes(i)) {
-          // 손/발: 핑크 네온
-          canvasCtx.fillStyle = "#ff007f";
-          canvasCtx.shadowColor = "#ff007f";
-          canvasCtx.arc(x, y, 6, 0, 2 * Math.PI);
-        } else if ([11, 12, 23, 24].includes(i)) {
-          // 어깨/골반: 옐로우 네온
-          canvasCtx.fillStyle = "#ffe600";
-          canvasCtx.shadowColor = "#ffe600";
-          canvasCtx.arc(x, y, 5, 0, 2 * Math.PI);
-        } else {
-          canvasCtx.fillStyle = "#00ffff";
-          canvasCtx.shadowColor = "#00ffff";
-          canvasCtx.arc(x, y, 4, 0, 2 * Math.PI);
+      for (const [startIdx, endIdx] of bodyConnections) {
+        const p1 = landmarks[startIdx];
+        const p2 = landmarks[endIdx];
+        if (p1 && p2 && (p1.visibility || 0) > 0.35 && (p2.visibility || 0) > 0.35) {
+          canvasCtx.beginPath();
+          canvasCtx.moveTo(p1.x * width, p1.y * height);
+          canvasCtx.lineTo(p2.x * width, p2.y * height);
+          canvasCtx.stroke();
         }
-        canvasCtx.fill();
       }
-    }
+
+      // 3. 신체 관절 포인트 그리기 (얼굴 0~10 제외)
+      for (let i = 11; i < landmarks.length; i++) {
+        // 주요 춤 관절만 포인트 렌더링 (어깨, 팔꿈치, 손목, 골반, 무릎, 발목)
+        if (![11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28].includes(i)) continue;
+
+        const lm = landmarks[i];
+        if ((lm.visibility || 0) > 0.35) {
+          const x = lm.x * width;
+          const y = lm.y * height;
+
+          canvasCtx.beginPath();
+          if ([15, 16, 27, 28].includes(i)) {
+            // 손목 / 발목: 강조 포인트
+            canvasCtx.fillStyle = palette.joint;
+            canvasCtx.shadowColor = palette.joint;
+            canvasCtx.shadowBlur = 8;
+            canvasCtx.arc(x, y, 6, 0, 2 * Math.PI);
+          } else if ([11, 12, 23, 24].includes(i)) {
+            // 어깨 / 골반: 코어 포인트
+            canvasCtx.fillStyle = palette.core;
+            canvasCtx.shadowColor = palette.core;
+            canvasCtx.shadowBlur = 6;
+            canvasCtx.arc(x, y, 5, 0, 2 * Math.PI);
+          } else {
+            canvasCtx.fillStyle = palette.head;
+            canvasCtx.shadowColor = palette.head;
+            canvasCtx.shadowBlur = 4;
+            canvasCtx.arc(x, y, 4, 0, 2 * Math.PI);
+          }
+          canvasCtx.fill();
+        }
+      }
+
+      // 4. 단일 머리(Head) 포인트 원형 렌더링 (얼굴 디테일 대체)
+      if (head && head.visibility > 0.35) {
+        const hx = head.x * width;
+        const hy = head.y * height;
+
+        // 머리 원 (단일 헤드 노드)
+        canvasCtx.beginPath();
+        canvasCtx.fillStyle = palette.head;
+        canvasCtx.shadowColor = palette.glow;
+        canvasCtx.shadowBlur = 10;
+        canvasCtx.arc(hx, hy, 10, 0, 2 * Math.PI);
+        canvasCtx.fill();
+
+        // 머리 내부 코어 닷
+        canvasCtx.beginPath();
+        canvasCtx.fillStyle = "#ffffff";
+        canvasCtx.arc(hx, hy, 4, 0, 2 * Math.PI);
+        canvasCtx.fill();
+
+        // 다인원일 때 인원 번호 배지 표시 (P1, P2 ...)
+        if (allLandmarks.length > 1) {
+          canvasCtx.font = "bold 10px sans-serif";
+          canvasCtx.fillStyle = "#ffffff";
+          canvasCtx.textAlign = "center";
+          canvasCtx.fillText(`P${pIdx + 1}`, hx, hy - 14);
+        }
+      }
+    });
 
     canvasCtx.restore();
   }
 
   /**
-   * 랜드마크 시계열 데이터를 분석하여 체크리스트 및 댄스 점수 산출
+   * 다인원 포즈 종합 분석 및 춤 판정
    */
-  evaluateDanceMotion(landmarks, timestamp) {
-    // 랜드마크가 전혀 없으면 즉시 모든 상태 초기화 및 0점
-    if (!landmarks) {
+  evaluateMultiPersonDance(allPoses, timestamp) {
+    if (!allPoses || allPoses.length === 0) {
       this.resetEvaluationState();
       return;
     }
 
-    // 주요 랜드마크 추출
-    // 얼굴: 0(코)
-    // 어깨: 11(좌), 12(우)
-    // 손목: 15(좌), 16(우)
-    // 골반: 23(좌), 24(우)
-    // 무릎: 25(좌), 26(우)
-    // 발목: 27(좌), 28(우)
-    const nose = landmarks[0];
-    const ls = landmarks[11], rs = landmarks[12];
-    const lw = landmarks[15], rw = landmarks[16];
-    const lh = landmarks[23], rh = landmarks[24];
-    const lk = landmarks[25], rk = landmarks[26];
-    const la = landmarks[27], ra = landmarks[28];
+    // 각 인원별 평가 실행
+    const evaluatedPersons = allPoses.map(pose => this.evaluateSinglePerson(pose));
 
-    // =========================================================================
-    // [핵심 필터 1] 얼굴 클로즈업 배제 및 전신/상체 관절 필수 감지
-    // =========================================================================
-    const shoulderVis = ((ls?.visibility || 0) + (rs?.visibility || 0)) / 2;
-    const hipVis = ((lh?.visibility || 0) + (rh?.visibility || 0)) / 2;
+    // 유효한 신체(어깨+골반 감지)를 가진 인원 필터링
+    const validPersons = evaluatedPersons.filter(p => p.isBodyDetected);
 
-    // 양 어깨와 양 골반의 좌표
-    const shoulderCenterY = (ls && rs) ? (ls.y + rs.y) / 2 : 0;
-    const shoulderCenterX = (ls && rs) ? (ls.x + rs.x) / 2 : 0;
-    const hipCenterY = (lh && rh) ? (lh.y + rh.y) / 2 : 0;
-    const hipCenterX = (lh && rh) ? (lh.x + rh.x) / 2 : 0;
-
-    // 몸통 길이(Torso Height): 어깨 중심 ~ 골반 중심
-    const torsoHeight = hipCenterY - shoulderCenterY;
-
-    // 어깨 너비
-    const shoulderWidth = (ls && rs) ? Math.abs(ls.x - rs.x) : 0;
-
-    // 얼굴 클로즈업 판별 조건:
-    // 1) 골반 가시성이 0.45 미만이거나, 골반이 화면 하단 밖(> 0.96)에 잘린 경우
-    // 2) 몸통 길이(torsoHeight)가 0.12 미만으로 너무 작거나 역전된 경우
-    // 3) 어깨 너비가 화면 가로의 65% 이상을 차지할 정도로 카메라에 바짝 다가온 경우
-    // 4) 코의 Y좌표와 어깨 Y좌표의 거리가 몸통 길이보다 긴 경우 (얼굴만 꽉 찬 화면)
-    const isCloseUp = hipVis < 0.45 ||
-                      hipCenterY > 0.96 ||
-                      torsoHeight < 0.12 ||
-                      shoulderWidth > 0.65;
-
-    // 관절 인식 여부 (어깨와 골반이 화면 내에 안정적으로 잡혀야 함)
-    const isCoreVisible = shoulderVis >= 0.6 && hipVis >= 0.5 && !isCloseUp;
-    this.checklist.is_body_detected = isCoreVisible;
-
-    // 몸이 제대로 감지되지 않았거나(얼굴만 비춤) 클로즈업이면 춤 판정 즉시 불인정(0점)
-    if (!this.checklist.is_body_detected) {
+    if (validPersons.length === 0) {
       this.resetEvaluationState();
       return;
     }
 
-    // =========================================================================
-    // [핵심 필터 2] 스케일 불변 운동 에너지 (몸통 크기 정규화 & 얼굴 움직임 배제)
-    // =========================================================================
-    let frameEnergy = 0;
-    if (this.history.length > 0) {
-      const prev = this.history[this.history.length - 1];
-      const prevLm = prev.landmarks;
+    // 가장 활발히 춤을 추고 있는 메인 댄서 선정
+    validPersons.sort((a, b) => b.danceScore - a.danceScore);
+    const primary = validPersons[0];
 
-      // 머리/얼굴(0~10)은 전면 제외하고, 오직 사지 및 몸통 관절만 추적!
-      // 손목(15,16)에 높은 가중치, 골반(23,24)/발목(27,28)/팔꿈치(13,14) 포함
-      const keyJoints = [
-        { idx: 15, weight: 1.5 }, // 좌 손목
-        { idx: 16, weight: 1.5 }, // 우 손목
-        { idx: 13, weight: 1.0 }, // 좌 팔꿈치
-        { idx: 14, weight: 1.0 }, // 우 팔꿈치
-        { idx: 23, weight: 1.2 }, // 좌 골반
-        { idx: 24, weight: 1.2 }, // 우 골반
-        { idx: 25, weight: 1.0 }, // 좌 무릎
-        { idx: 26, weight: 1.0 }, // 우 무릎
-        { idx: 27, weight: 1.3 }, // 좌 발목
-        { idx: 28, weight: 1.3 }  // 우 발목
-      ];
-
-      let weightedDistSum = 0;
-      let totalWeight = 0;
-
-      // 카메라 거리와 무관하도록 모든 변위를 torsoHeight로 정규화
-      const safeTorsoScale = Math.max(0.12, torsoHeight);
-
-      for (const item of keyJoints) {
-        const currPoint = landmarks[item.idx];
-        const prevPoint = prevLm ? prevLm[item.idx] : null;
-
-        if (currPoint && prevPoint && (currPoint.visibility || 0) > 0.35) {
-          const dx = (currPoint.x - prevPoint.x) / safeTorsoScale;
-          const dy = (currPoint.y - prevPoint.y) / safeTorsoScale;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          weightedDistSum += dist * item.weight;
-          totalWeight += item.weight;
-        }
-      }
-
-      if (totalWeight > 0) {
-        // 몸통 대비 이동 비율 (1.0 = 몸통 길이만큼 1프레임에 이동)
-        frameEnergy = (weightedDistSum / totalWeight) * 10;
-      }
+    // 그룹 시너지: 2명 이상이 함께 춤출 경우 활성도 평균 보정
+    let groupAvgScore = primary.danceScore;
+    if (validPersons.length > 1) {
+      const avg = validPersons.reduce((sum, p) => sum + p.danceScore, 0) / validPersons.length;
+      groupAvgScore = Math.round(primary.danceScore * 0.75 + avg * 0.25);
     }
 
-    // 시계열 버퍼에 기록
+    // 메인 댄서의 시계열 버퍼 기록
     this.history.push({
       timestamp,
-      landmarks,
-      energy: frameEnergy,
-      hipY: hipCenterY,
-      torsoHeight,
-      lwY: lw?.y || 0.5,
-      rwY: rw?.y || 0.5
+      energy: primary.energy,
+      hipY: primary.hipY,
+      headY: primary.headY,
+      torsoHeight: primary.torsoHeight,
+      lwY: primary.lwY,
+      rwY: primary.rwY
     });
 
     if (this.history.length > this.bufferSize) {
       this.history.shift();
     }
 
-    // 최근 프레임 평균 에너지 계산 (최근 1초)
-    const recentFrames = this.history.slice(-30);
-    const avgEnergy = recentFrames.reduce((acc, f) => acc + f.energy, 0) / (recentFrames.length || 1);
-    this.metrics.energy_level = parseFloat(avgEnergy.toFixed(2));
+    // 체크리스트 반영
+    this.checklist.is_body_detected = true;
+    this.checklist.is_moving = primary.isMoving;
 
-    // 기준 2: 유의미한 움직임 감지
-    // 정적 자세/미세 숨쉬기(0.2 미만) 필터링 -> 0.35 이상일 때만 움직임 인정
-    this.checklist.is_moving = avgEnergy >= 0.35;
-
-    // =========================================================================
-    // [기준 3] 리듬 주기성 & 수직 바운스 분석 (얼굴 끄덕임 제외, 골반 바운스 기반)
-    // =========================================================================
-    const rhythmResult = this.analyzePeriodicity(this.history, torsoHeight);
+    // 리듬 주기성 (골반 바운스 및 머리 끄덕임 배제 분석)
+    const rhythmResult = this.analyzePeriodicity(this.history, primary.torsoHeight);
     this.checklist.is_rhythmic = rhythmResult.isRhythmic;
     this.metrics.periodicity_score = parseFloat(rhythmResult.score.toFixed(2));
     this.metrics.bpm_estimate = rhythmResult.bpm;
 
-    // =========================================================================
-    // [기준 4] 사지 가동 범위 (Range of Motion)
-    // =========================================================================
-    const dynamicResult = this.analyzeRangeOfMotion(this.history, torsoHeight);
-    this.checklist.is_dynamic = dynamicResult.isDynamic;
+    // 가동 범위
+    this.checklist.is_dynamic = primary.isDynamic;
 
-    // =========================================================================
-    // [기준 5] 연속성 및 지속 시간 (Sustained Motion)
-    // =========================================================================
+    // 지속 시간
     if (this.checklist.is_moving && (this.checklist.is_rhythmic || this.checklist.is_dynamic)) {
       this.sustainedDanceFrames = Math.min(100, this.sustainedDanceFrames + 1.2);
     } else {
       this.sustainedDanceFrames = Math.max(0, this.sustainedDanceFrames - 2.0);
     }
-    this.checklist.is_sustained = this.sustainedDanceFrames >= 35; // 약 1.2초 이상 지속
+    this.checklist.is_sustained = this.sustainedDanceFrames >= 35;
 
-    // =========================================================================
-    // [종합 댄스 점수 산출]
-    // =========================================================================
-    let score = 0;
-    // 1. 관절 안정 감지 (10점)
-    score += 10;
-    // 2. 운동 에너지 (최대 25점: avgEnergy 0.35 ~ 2.0 범위)
-    const energyScore = Math.min(25, Math.max(0, ((avgEnergy - 0.25) / 1.5) * 25));
-    score += energyScore;
-    // 3. 리듬 주기성 (최대 35점)
-    score += rhythmResult.score * 35;
-    // 4. 가동 범위 (최대 18점)
-    score += dynamicResult.score * 18;
-    // 5. 지속성 (최대 12점)
-    score += Math.min(12, (this.sustainedDanceFrames / 35) * 12);
-
-    // 움직이지 않거나 리듬/가동범위가 전혀 없으면 점수를 대폭 억제
-    if (!this.checklist.is_moving) {
-      score = Math.min(15, score * 0.3);
-    }
-
-    // 스무딩 적용
+    // 최종 댄스 점수
     this.metrics.dance_score = Math.round(
-      this.metrics.dance_score * 0.65 + Math.min(100, Math.max(0, score)) * 0.35
+      this.metrics.dance_score * 0.65 + groupAvgScore * 0.35
     );
+    this.metrics.energy_level = primary.energy;
   }
 
   /**
-   * 시계열 데이터에서 골반/손목의 주기적 바운스 검출 및 BPM 추정
+   * 단일 인원의 랜드마크 분석 및 점수 산출
+   */
+  evaluateSinglePerson(landmarks) {
+    const head = this.getHeadPoint(landmarks);
+    const ls = landmarks[11], rs = landmarks[12];
+    const lh = landmarks[23], rh = landmarks[24];
+    const lw = landmarks[15], rw = landmarks[16];
+
+    const shoulderVis = ((ls?.visibility || 0) + (rs?.visibility || 0)) / 2;
+    const hipVis = ((lh?.visibility || 0) + (rh?.visibility || 0)) / 2;
+
+    const shoulderCenterY = (ls && rs) ? (ls.y + rs.y) / 2 : 0;
+    const hipCenterY = (lh && rh) ? (lh.y + rh.y) / 2 : 0;
+    const torsoHeight = hipCenterY - shoulderCenterY;
+    const shoulderWidth = (ls && rs) ? Math.abs(ls.x - rs.x) : 0;
+
+    // 얼굴/상체 클로즈업 필터링
+    const isCloseUp = hipVis < 0.4 ||
+                      hipCenterY > 0.98 ||
+                      torsoHeight < 0.10 ||
+                      shoulderWidth > 0.70;
+
+    const isBodyDetected = shoulderVis >= 0.55 && hipVis >= 0.45 && !isCloseUp;
+
+    if (!isBodyDetected) {
+      return {
+        isBodyDetected: false,
+        danceScore: 0,
+        energy: 0,
+        isMoving: false,
+        isDynamic: false,
+        hipY: hipCenterY,
+        headY: head?.y || 0.2,
+        torsoHeight: Math.max(0.12, torsoHeight),
+        lwY: lw?.y || 0.5,
+        rwY: rw?.y || 0.5
+      };
+    }
+
+    const safeTorsoScale = Math.max(0.12, torsoHeight);
+
+    // 사지 관절 에너지 계산 (얼굴 제외, 손목/발목/골반 중심)
+    let frameEnergy = 0;
+    if (this.history.length > 0) {
+      const prev = this.history[this.history.length - 1];
+      // 이전 손목/골반 변위 비교
+      const dyLw = Math.abs((lw?.y || 0.5) - prev.lwY) / safeTorsoScale;
+      const dyRw = Math.abs((rw?.y || 0.5) - prev.rwY) / safeTorsoScale;
+      const dyHip = Math.abs(hipCenterY - prev.hipY) / safeTorsoScale;
+      frameEnergy = (dyLw * 1.5 + dyRw * 1.5 + dyHip * 2.0) * 8;
+    }
+
+    const isMoving = frameEnergy >= 0.35;
+
+    // 사지 가동 범위
+    let armSpan = 0;
+    if (lw && rw) {
+      const dx = (lw.x - rw.x) / safeTorsoScale;
+      const dy = (lw.y - rw.y) / safeTorsoScale;
+      armSpan = Math.sqrt(dx * dx + dy * dy);
+    }
+    const isDynamic = armSpan >= 1.1;
+
+    // 개인 댄스 점수
+    let score = 15;
+    score += Math.min(30, (frameEnergy / 2.0) * 30);
+    score += isDynamic ? 25 : 10;
+    if (!isMoving) score = Math.min(15, score * 0.3);
+
+    return {
+      isBodyDetected: true,
+      danceScore: Math.min(100, Math.round(score)),
+      energy: parseFloat(frameEnergy.toFixed(2)),
+      isMoving,
+      isDynamic,
+      hipY: hipCenterY,
+      headY: head?.y || 0.2,
+      torsoHeight: safeTorsoScale,
+      lwY: lw?.y || 0.5,
+      rwY: rw?.y || 0.5
+    };
+  }
+
+  /**
+   * 시계열 데이터에서 골반 바운스 기반 주기성 검출
    */
   analyzePeriodicity(history, torsoHeight) {
     if (history.length < 30) {
@@ -429,13 +501,10 @@ export class PoseEngine {
     }
 
     const safeTorsoScale = Math.max(0.12, torsoHeight || 0.2);
-
-    // 골반의 Y 변화(수직 바운스)를 torsoHeight로 정규화한 신호
     const signal = history.map(h => (h.hipY / safeTorsoScale));
     const mean = signal.reduce((a, b) => a + b, 0) / signal.length;
     const centered = signal.map(v => v - mean);
 
-    // 피크 검출: 단순 떨림이 아닌 몸통 길이의 최소 3.5% 이상의 바운스
     const minAmplitude = 0.035;
     const peaks = [];
 
@@ -451,7 +520,6 @@ export class PoseEngine {
       return { isRhythmic: false, score: 0, bpm: null };
     }
 
-    // 피크 간격 계산
     const intervals = [];
     for (let i = 1; i < peaks.length; i++) {
       intervals.push(peaks[i] - peaks[i - 1]);
@@ -461,9 +529,7 @@ export class PoseEngine {
     const variance = intervals.reduce((acc, val) => acc + Math.pow(val - avgInterval, 2), 0) / intervals.length;
     const stdDev = Math.sqrt(variance);
 
-    // 댄스 유효 인터벌: 8프레임 ~ 35프레임 (약 55 ~ 220 BPM)
     const isValidInterval = avgInterval >= 8 && avgInterval <= 35;
-    // 규칙성 (표준편차가 작을수록 박자가 일정)
     const regularity = Math.max(0, 1 - (stdDev / (avgInterval || 1)));
 
     let bpm = null;
@@ -483,42 +549,7 @@ export class PoseEngine {
   }
 
   /**
-   * 상하좌우 관절 가동 범위 (Range of Motion) 계산
-   */
-  analyzeRangeOfMotion(history, torsoHeight) {
-    if (history.length < 15) {
-      return { isDynamic: false, score: 0 };
-    }
-
-    const safeTorsoScale = Math.max(0.12, torsoHeight || 0.2);
-    const last = history[history.length - 1].landmarks;
-    if (!last) return { isDynamic: false, score: 0 };
-
-    // 양 손목 거리
-    const lw = last[15], rw = last[16];
-    let armSpan = 0;
-    if (lw && rw) {
-      const dx = (lw.x - rw.x) / safeTorsoScale;
-      const dy = (lw.y - rw.y) / safeTorsoScale;
-      armSpan = Math.sqrt(dx * dx + dy * dy);
-    }
-
-    // 최근 15프레임 손목 수직 궤적 진폭
-    const lwYs = history.map(h => h.lwY).filter(Boolean);
-    const rwYs = history.map(h => h.rwY).filter(Boolean);
-    const rangeLw = (Math.max(...lwYs) - Math.min(...lwYs)) / safeTorsoScale;
-    const rangeRw = (Math.max(...rwYs) - Math.min(...rwYs)) / safeTorsoScale;
-    const maxSweep = Math.max(rangeLw, rangeRw);
-
-    // 몸통 대비 충분한 팔 궤적(0.4 이상) 또는 팔 벌림(1.2 이상)
-    const isDynamic = maxSweep >= 0.35 || armSpan >= 1.2;
-    const score = Math.min(1.0, Math.max(0, (maxSweep / 0.8) * 0.6 + (armSpan / 2.0) * 0.4));
-
-    return { isDynamic, score };
-  }
-
-  /**
-   * 감지 실패 또는 클로즈업 시 상태 안전 초기화
+   * 초기화
    */
   resetEvaluationState() {
     this.checklist.is_body_detected = false;
@@ -526,7 +557,6 @@ export class PoseEngine {
     this.checklist.is_rhythmic = false;
     this.checklist.is_dynamic = false;
     this.checklist.is_sustained = false;
-    // 점수를 빠르게 0으로 감소
     this.metrics.dance_score = Math.max(0, this.metrics.dance_score - 8);
     this.metrics.energy_level = 0;
     this.metrics.bpm_estimate = null;
@@ -534,9 +564,6 @@ export class PoseEngine {
     this.sustainedDanceFrames = 0;
   }
 
-  /**
-   * 카메라 전환 및 재시작 시 엔진 완전 초기화
-   */
   reset() {
     this.history = [];
     this.lastTimestamp = -1;
@@ -545,6 +572,7 @@ export class PoseEngine {
     this.metrics.energy_level = 0;
     this.metrics.bpm_estimate = null;
     this.metrics.periodicity_score = 0;
+    this.metrics.person_count = 0;
     this.checklist = {
       is_body_detected: false,
       is_moving: false,

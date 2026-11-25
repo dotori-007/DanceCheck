@@ -72,6 +72,7 @@ class MetricDetails(BaseModel):
     periodicity_score: float = Field(..., description="주기성 일치도 (0~1)")
     analysis_duration_sec: float = Field(..., description="분석 수행 시간(초)")
     fps: Optional[float] = Field(None, description="평균 클라이언트 FPS")
+    person_count: Optional[int] = Field(1, description="감지된 인원 수")
 
 class DanceLogEntry(BaseModel):
     session_id: Optional[str] = Field(None, description="세션 고유 ID")
