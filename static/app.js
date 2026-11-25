@@ -283,7 +283,7 @@ class DanceCheckApp {
   }
 
   /**
-   * 녹화 캔버스에 비디오 + AI 스켈레톤 + 분석 워터마크 HUD 합성
+   * 녹화 캔버스에 카메라 비디오 + AI 스켈레톤 + 분석 워터마크 HUD 합성
    */
   captureCompositeRecordingFrame(result) {
     const rw = this.video.videoWidth || 640;
@@ -296,19 +296,20 @@ class DanceCheckApp {
 
     const ctx = this.recCtx;
 
-    // 1. 카메라 비디오 프레임 그리기 (전면 카메라는 좌우 반전 반영)
+    // 1. 카메라 비디오 프레임 + 스켈레톤 함께 그리기 (전면 카메라는 둘 다 일관되게 좌우 반전)
     ctx.save();
     if (this.currentFacingMode === "user") {
       ctx.translate(rw, 0);
       ctx.scale(-1, 1);
     }
+    // 카메라 원본 비디오 렌더링
     ctx.drawImage(this.video, 0, 0, rw, rh);
+
+    // 스켈레톤 골격 오버레이 (비디오를 지우지 않도록 clear = false 전달)
+    this.poseEngine.drawLandmarks(ctx, result.allLandmarks, rw, rh, false);
     ctx.restore();
 
-    // 2. 스켈레톤 골격 렌더링
-    this.poseEngine.drawLandmarks(ctx, result.allLandmarks, rw, rh);
-
-    // 3. 비디오 상단에 멋진 Cyberpunk HUD 워터마크 렌더링
+    // 2. 비디오 상단에 Cyberpunk HUD 워터마크 렌더링 (텍스트는 반전되지 않도록 unmirrored 상태에서 그림)
     ctx.save();
     const score = result.windowMetrics?.avg_score || result.metrics.dance_score;
     const isDancing = result.windowMetrics?.is_dancing || result.isDancing;
@@ -316,13 +317,14 @@ class DanceCheckApp {
     const bpmText = result.metrics.bpm_estimate ? ` | ${result.metrics.bpm_estimate} BPM` : "";
 
     // 상단 반투명 HUD 배너 바
+    const bannerW = Math.min(rw - 32, 340);
     ctx.fillStyle = "rgba(11, 14, 23, 0.78)";
-    ctx.fillRect(16, 16, Math.min(rw - 32, 340), 44);
+    ctx.fillRect(16, 16, bannerW, 44);
 
     // 네온 테두리
     ctx.lineWidth = 1.5;
     ctx.strokeStyle = isDancing ? "#ff007f" : "#00f0ff";
-    ctx.strokeRect(16, 16, Math.min(rw - 32, 340), 44);
+    ctx.strokeRect(16, 16, bannerW, 44);
 
     // 텍스트 출력
     ctx.font = "bold 13px 'JetBrains Mono', monospace";

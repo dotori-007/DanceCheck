@@ -691,12 +691,15 @@ export class PoseEngine {
 
   /**
    * 스켈레톤 초고속 렌더링 (가로/세로 비율 자동 정합)
+   * clear가 true일 때만 clearRect 실행 (비디오 합성 녹화 시 비디오 유지)
    */
-  drawLandmarks(canvasCtx, allLandmarks, width, height) {
+  drawLandmarks(canvasCtx, allLandmarks, width, height, clear = true) {
     if (!canvasCtx) return;
 
     canvasCtx.save();
-    canvasCtx.clearRect(0, 0, width, height);
+    if (clear) {
+      canvasCtx.clearRect(0, 0, width, height);
+    }
 
     if (!allLandmarks || allLandmarks.length === 0) {
       canvasCtx.restore();
