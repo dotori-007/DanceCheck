@@ -1,6 +1,7 @@
 /**
  * DanceCheck - app.js
- * 카메라 제어, UI 실시간 갱신, 챌린지 모드, 서버 REST API 통신
+ * 카메라 제어, UI 실시간 갱신, MP4 영상 녹화 및 내보내기
+ * 100% 클라이언트 연산 (모바일 가로/세로 대응)
  */
 
 import { PoseEngine } from "./poseEngine.js";
@@ -18,7 +19,6 @@ class DanceCheckApp {
     this.modelStatusText = document.getElementById("model-status");
     this.fpsBadge = document.getElementById("fps-badge");
     this.cameraFlipBtn = document.getElementById("camera-flip-btn");
-    this.historyOpenBtn = document.getElementById("history-open-btn");
     this.liveStatusBadge = document.getElementById("live-status-badge");
     this.liveStatusText = document.getElementById("live-status-text");
     this.danceScoreBar = document.getElementById("dance-score-bar");
@@ -50,33 +50,28 @@ class DanceCheckApp {
     this.checklistCounter = document.getElementById("checklist-counter");
     this.bpmDisplay = document.getElementById("bpm-display");
 
-    // 액션 버튼
-    this.challengeBtn = document.getElementById("challenge-btn");
-    this.saveLogBtn = document.getElementById("save-log-btn");
+    // MP4 녹화 관련 UI
+    this.recordBtn = document.getElementById("record-btn");
+    this.recordBtnText = document.getElementById("record-btn-text");
+    this.recIndicator = document.getElementById("rec-indicator");
+    this.recTimer = document.getElementById("rec-timer");
+    this.recCameraBadge = document.getElementById("rec-camera-badge");
+    this.recCameraTimer = document.getElementById("rec-camera-timer");
 
-    // 히스토리 모달
-    this.historyModal = document.getElementById("history-modal");
-    this.historyCloseBtn = document.getElementById("history-close-btn");
-    this.historyList = document.getElementById("history-list");
-    this.historyCount = document.getElementById("history-count");
-    this.historyRefreshBtn = document.getElementById("history-refresh-btn");
-    this.historyClearBtn = document.getElementById("history-clear-btn");
-
-    // 챌린지 결과 모달
-    this.resultModal = document.getElementById("result-modal");
-    this.resCloseBtn = document.getElementById("res-close-btn");
-    this.resSaveBtn = document.getElementById("res-save-btn");
-    this.resIcon = document.getElementById("res-icon");
-    this.resTitle = document.getElementById("res-title");
-    this.resVerdict = document.getElementById("res-verdict");
-    this.resScore = document.getElementById("res-score");
-    this.resBpm = document.getElementById("res-bpm");
-    this.resEnergy = document.getElementById("res-energy");
+    // MP4 내보내기/미리보기 모달
+    this.exportModal = document.getElementById("export-modal");
+    this.exportVideoPlayer = document.getElementById("export-video-player");
+    this.expScore = document.getElementById("exp-score");
+    this.expDuration = document.getElementById("exp-duration");
+    this.expVerdict = document.getElementById("exp-verdict");
+    this.downloadMp4Btn = document.getElementById("download-mp4-btn");
+    this.exportCloseBtn = document.getElementById("export-close-btn");
+    this.exportCancelBtn = document.getElementById("export-cancel-btn");
 
     // 토스트
     this.toastContainer = document.getElementById("toast-container");
 
-    // 상태 변수
+    // 카메라 및 루프 상태
     this.currentFacingMode = "user"; // 'user' (전면) or 'environment' (후면)
     this.stream = null;
     this.isRunning = false;
@@ -84,10 +79,19 @@ class DanceCheckApp {
     this.loopGeneration = 0;
     this.lastProcessedResult = null;
 
-    // 챌린지 모드 상태
-    this.isChallengeActive = false;
-    this.challengeFrames = [];
-    this.challengePendingResult = null;
+    // MP4 녹화 상태 관리
+    this.isRecording = false;
+    this.mediaRecorder = null;
+    this.recordedChunks = [];
+    this.recordingStartTime = 0;
+    this.recordingTimerInterval = null;
+    this.recordingScores = [];
+    this.lastExportedBlob = null;
+    this.lastExportedUrl = null;
+
+    // 비디오 + 스켈레톤 + HUD 합성용 오프스크린 레코딩 캔버스
+    this.recCanvas = document.createElement("canvas");
+    this.recCtx = this.recCanvas.getContext("2d");
 
     this.init();
   }
@@ -97,7 +101,7 @@ class DanceCheckApp {
 
     try {
       this.modelStatusText.innerHTML = '<span class="spinner"></span> MediaPipe Pose AI 로드 중...';
-      await this.poseEngine.initialize(this.canvas);
+      await this.poseEngine.initialize();
       this.modelStatusText.innerHTML = '✅ AI 모델 준비 완료 (Client 100%)';
       this.startBtn.disabled = false;
     } catch (err) {
@@ -111,16 +115,18 @@ class DanceCheckApp {
     this.startBtn.addEventListener("click", () => this.startCamera());
     this.cameraFlipBtn.addEventListener("click", () => this.toggleCameraFlip());
 
-    this.historyOpenBtn.addEventListener("click", () => this.openHistoryModal());
-    this.historyCloseBtn.addEventListener("click", () => this.closeHistoryModal());
-    this.historyRefreshBtn.addEventListener("click", () => this.fetchLogs());
-    this.historyClearBtn.addEventListener("click", () => this.clearLogs());
+    // MP4 녹화 토글
+    this.recordBtn.addEventListener("click", () => this.toggleRecording());
 
-    this.saveLogBtn.addEventListener("click", () => this.saveCurrentSnapshot());
-    this.challengeBtn.addEventListener("click", () => this.startChallengeSession());
+    // 모달 액션
+    this.downloadMp4Btn.addEventListener("click", () => this.downloadExportedVideo());
+    this.exportCloseBtn.addEventListener("click", () => this.closeExportModal());
+    this.exportCancelBtn.addEventListener("click", () => this.closeExportModal());
 
-    this.resCloseBtn.addEventListener("click", () => this.closeResultModal());
-    this.resSaveBtn.addEventListener("click", () => this.saveChallengeResult());
+    // 모달 배경 클릭 시 닫기
+    this.exportModal.addEventListener("click", (e) => {
+      if (e.target === this.exportModal) this.closeExportModal();
+    });
 
     // 화면 회전(가로/세로 전환) 감지 대응
     window.addEventListener("orientationchange", () => {
@@ -128,21 +134,12 @@ class DanceCheckApp {
         if (this.isRunning) this.startCamera();
       }, 350);
     });
-
-    // 배경 클릭 시 모달 닫기
-    this.historyModal.addEventListener("click", (e) => {
-      if (e.target === this.historyModal) this.closeHistoryModal();
-    });
-    this.resultModal.addEventListener("click", (e) => {
-      if (e.target === this.resultModal) this.closeResultModal();
-    });
   }
 
   /**
    * 카메라 권한 획득 및 스트리밍 시작 (iOS Safari / Android Chrome 호환)
    */
   async startCamera() {
-    // 이전 루프 무효화
     this.loopGeneration++;
     const currentGen = this.loopGeneration;
 
@@ -155,7 +152,6 @@ class DanceCheckApp {
       this.stream = null;
     }
 
-    // 엔진 버퍼 및 캔버스 초기화
     this.poseEngine.reset();
     this.canvasCtx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
@@ -174,7 +170,6 @@ class DanceCheckApp {
       this.stream = await navigator.mediaDevices.getUserMedia(constraints);
       this.video.srcObject = this.stream;
 
-      // 비디오 메타데이터 로드 대기 (해상도 0x0 상태에서 AI 추론 시도 방지)
       await new Promise((resolve) => {
         if (this.video.readyState >= HTMLMediaElement.HAVE_METADATA) {
           resolve();
@@ -189,7 +184,6 @@ class DanceCheckApp {
       this.startOverlay.classList.remove("active");
       this.isRunning = true;
 
-      // 이전 세대 루프가 겹치지 않도록 현재 세대로만 단일 루프 실행
       this.requestFrameLoop(currentGen);
       this.showToast(this.currentFacingMode === "user" ? "전면 카메라 활성화" : "후면 카메라 활성화");
     } catch (err) {
@@ -215,6 +209,11 @@ class DanceCheckApp {
 
   async toggleCameraFlip() {
     if (this.isFlipping) return;
+    if (this.isRecording) {
+      this.showToast("녹화 중에는 카메라를 전환할 수 없습니다.");
+      return;
+    }
+
     this.isFlipping = true;
     this.cameraFlipBtn.disabled = true;
 
@@ -230,11 +229,10 @@ class DanceCheckApp {
   }
 
   /**
-   * 렌더링 및 추론 루프 (중복 실행 방지 generation 적용)
+   * 렌더링 및 추론 루프
    */
   requestFrameLoop(generation) {
     const loop = (timestamp) => {
-      // 카메라 전환 등으로 세대가 바뀌었거나 정지된 경우 루프 자연 종료
       if (!this.isRunning || generation !== this.loopGeneration) return;
 
       if (this.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
@@ -256,7 +254,6 @@ class DanceCheckApp {
   }
 
   renderFrame(timestamp) {
-    // 캔버스 크기를 비디오 실제 해상도와 동기화
     if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
       this.canvas.width = this.video.videoWidth || 480;
       this.canvas.height = this.video.videoHeight || 640;
@@ -268,7 +265,7 @@ class DanceCheckApp {
 
     this.lastProcessedResult = result;
 
-    // 스켈레톤 랜드마크 드로잉 (다인원 지원)
+    // 화면 오버레이 캔버스에 랜드마크 드로잉
     this.poseEngine.drawLandmarks(
       this.canvasCtx,
       result.allLandmarks,
@@ -279,16 +276,73 @@ class DanceCheckApp {
     // UI 동기화
     this.updateUI(result);
 
-    // 챌린지 모드 동작 중이면 프레임 기록
-    if (this.isChallengeActive) {
-      this.challengeFrames.push(result);
+    // MP4 녹화 중인 경우 비디오 + 스켈레톤 + HUD를 합성하여 레코딩 캔버스에 렌더링
+    if (this.isRecording && this.mediaRecorder?.state === "recording") {
+      this.captureCompositeRecordingFrame(result);
     }
   }
 
+  /**
+   * 녹화 캔버스에 비디오 + AI 스켈레톤 + 분석 워터마크 HUD 합성
+   */
+  captureCompositeRecordingFrame(result) {
+    const rw = this.video.videoWidth || 640;
+    const rh = this.video.videoHeight || 480;
+
+    if (this.recCanvas.width !== rw || this.recCanvas.height !== rh) {
+      this.recCanvas.width = rw;
+      this.recCanvas.height = rh;
+    }
+
+    const ctx = this.recCtx;
+
+    // 1. 카메라 비디오 프레임 그리기 (전면 카메라는 좌우 반전 반영)
+    ctx.save();
+    if (this.currentFacingMode === "user") {
+      ctx.translate(rw, 0);
+      ctx.scale(-1, 1);
+    }
+    ctx.drawImage(this.video, 0, 0, rw, rh);
+    ctx.restore();
+
+    // 2. 스켈레톤 골격 렌더링
+    this.poseEngine.drawLandmarks(ctx, result.allLandmarks, rw, rh);
+
+    // 3. 비디오 상단에 멋진 Cyberpunk HUD 워터마크 렌더링
+    ctx.save();
+    const score = result.windowMetrics?.avg_score || result.metrics.dance_score;
+    const isDancing = result.windowMetrics?.is_dancing || result.isDancing;
+    const stateText = isDancing ? "🔥 DANCING" : (result.windowMetrics?.rates.moving >= 35 ? "🚶 MOVING" : "🧍 IDLE");
+    const bpmText = result.metrics.bpm_estimate ? ` | ${result.metrics.bpm_estimate} BPM` : "";
+
+    // 상단 반투명 HUD 배너 바
+    ctx.fillStyle = "rgba(11, 14, 23, 0.78)";
+    ctx.fillRect(16, 16, Math.min(rw - 32, 340), 44);
+
+    // 네온 테두리
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = isDancing ? "#ff007f" : "#00f0ff";
+    ctx.strokeRect(16, 16, Math.min(rw - 32, 340), 44);
+
+    // 텍스트 출력
+    ctx.font = "bold 13px 'JetBrains Mono', monospace";
+    ctx.fillStyle = isDancing ? "#ff007f" : "#00f0ff";
+    ctx.fillText("⚡ DanceCheck AI", 28, 35);
+
+    ctx.font = "bold 12px Pretendard, sans-serif";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(`[${stateText}] 점수: ${score}%${bpmText}`, 28, 51);
+
+    ctx.restore();
+
+    // 녹화 중 점수 샘플 수집
+    this.recordingScores.push(score);
+  }
+
   updateUI(result) {
-    const { checklist, metrics, isDancing, landmarks, windowMetrics } = result;
+    const { metrics, landmarks, windowMetrics } = result;
     const wm = windowMetrics || {
-      is_dancing: isDancing,
+      is_dancing: false,
       avg_score: metrics.dance_score,
       avg_energy: metrics.energy_level,
       active_count: 0,
@@ -326,15 +380,12 @@ class DanceCheckApp {
     }
 
     // 4. 체크리스트 HUD 업데이트 (최근 3초 평균 충족률 반영)
-    // Body (전신 관절)
     const bodyActive = wm.rates.body >= 50;
     this.toggleCheckItem(this.chkItems.body, bodyActive, `${wm.rates.body}% (인식됨)`, `${wm.rates.body}% (미인식)`);
 
-    // Moving (운동 에너지)
     const movingActive = wm.rates.moving >= 45;
     this.toggleCheckItem(this.chkItems.moving, movingActive, `${wm.rates.moving}% (${wm.avg_energy} E)`, `${wm.rates.moving}% (정지)`);
 
-    // Rhythm (리듬 주기성)
     const rhythmActive = wm.rates.rhythm >= 40;
     const rhythmLabel = metrics.bpm_estimate ? `${wm.rates.rhythm}% (${metrics.bpm_estimate} BPM)` : `${wm.rates.rhythm}% 비트`;
     this.toggleCheckItem(this.chkItems.rhythm, rhythmActive, rhythmLabel, `${wm.rates.rhythm}% 무작위`);
@@ -344,15 +395,12 @@ class DanceCheckApp {
       this.bpmDisplay.textContent = `주기적 비트/진동 패턴 (3초 평균 ${wm.rates.rhythm}%)`;
     }
 
-    // Dynamic (가동 범위)
     const dynamicActive = wm.rates.dynamic >= 40;
     this.toggleCheckItem(this.chkItems.dynamic, dynamicActive, `${wm.rates.dynamic}% 충족`, `${wm.rates.dynamic}% 제한적`);
 
-    // Sustained (지속 시간)
     const sustainedActive = wm.rates.sustained >= 45;
     this.toggleCheckItem(this.chkItems.sustained, sustainedActive, `${wm.rates.sustained}% 유지됨`, `${wm.rates.sustained}% 부족`);
 
-    // 총 충족 카운터 (3초 평균 기준)
     this.checklistCounter.textContent = `3초 평균: ${wm.active_count} / 5 충족`;
   }
 
@@ -367,244 +415,178 @@ class DanceCheckApp {
   }
 
   /**
-   * 7초 댄스 챌린지 모드 시작
+   * =========================================================================
+   * MP4 비디오 녹화 & 내보내기 엔진
+   * =========================================================================
    */
-  startChallengeSession() {
+
+  getSupportedMimeType() {
+    const types = [
+      "video/mp4;codecs=avc1",
+      "video/mp4",
+      "video/webm;codecs=vp9",
+      "video/webm;codecs=vp8",
+      "video/webm"
+    ];
+    for (const t of types) {
+      if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(t)) {
+        return t;
+      }
+    }
+    return "";
+  }
+
+  toggleRecording() {
+    if (this.isRecording) {
+      this.stopRecording();
+    } else {
+      this.startRecording();
+    }
+  }
+
+  startRecording() {
     if (!this.isRunning) {
       this.showToast("먼저 카메라를 시작해주세요.");
       return;
     }
-    if (this.isChallengeActive) return;
 
-    this.isChallengeActive = true;
-    this.challengeFrames = [];
-    this.challengeBtn.disabled = true;
+    const rw = this.video.videoWidth || 640;
+    const rh = this.video.videoHeight || 480;
+    this.recCanvas.width = rw;
+    this.recCanvas.height = rh;
 
-    let timeLeft = 7;
-    this.challengeBtn.textContent = `⏳ 분석 중... ${timeLeft}s`;
-    this.showToast("🎵 7초 댄스 챌린지 시작! 신나게 춤을 춰보세요!");
+    // 30 FPS 캔버스 캡처 스트림 생성
+    const stream = this.recCanvas.captureStream(30);
+    const mimeType = this.getSupportedMimeType();
 
-    const timer = setInterval(() => {
-      timeLeft--;
-      if (timeLeft > 0) {
-        this.challengeBtn.textContent = `⏳ 분석 중... ${timeLeft}s`;
-      } else {
-        clearInterval(timer);
-        this.finishChallengeSession();
+    try {
+      const options = mimeType ? { mimeType, videoBitsPerSecond: 2500000 } : {};
+      this.mediaRecorder = new MediaRecorder(stream, options);
+    } catch (e) {
+      console.warn("MIME 타입 지정 실패, 기본 레코더 사용:", e);
+      this.mediaRecorder = new MediaRecorder(stream);
+    }
+
+    this.recordedChunks = [];
+    this.recordingScores = [];
+
+    this.mediaRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        this.recordedChunks.push(event.data);
       }
-    }, 1000);
+    };
+
+    this.mediaRecorder.onstop = () => {
+      this.finishRecordingAndExport();
+    };
+
+    this.mediaRecorder.start(250); // 250ms 단위 슬라이스
+    this.isRecording = true;
+    this.recordingStartTime = Date.now();
+
+    // UI 상태 갱신
+    this.recordBtn.classList.add("btn-recording");
+    this.recordBtnText.textContent = "⏹️ 녹화 종료 및 MP4 내보내기";
+    this.recIndicator.style.display = "inline-flex";
+    this.recCameraBadge.style.display = "flex";
+
+    this.updateRecordingTimerDisplay(0);
+    this.recordingTimerInterval = setInterval(() => {
+      const elapsedSec = Math.floor((Date.now() - this.recordingStartTime) / 1000);
+      this.updateRecordingTimerDisplay(elapsedSec);
+    }, 500);
+
+    this.showToast("🎥 댄스 영상 녹화가 시작되었습니다! 자유롭게 춤을 춰보세요!");
   }
 
-  finishChallengeSession() {
-    this.isChallengeActive = false;
-    this.challengeBtn.disabled = false;
-    this.challengeBtn.textContent = "⏱️ 7초 댄스 판정 챌린지";
+  updateRecordingTimerDisplay(totalSec) {
+    const mins = String(Math.floor(totalSec / 60)).padStart(2, "0");
+    const secs = String(totalSec % 60).padStart(2, "0");
+    const timeStr = `${mins}:${secs}`;
+    this.recTimer.textContent = timeStr;
+    this.recCameraTimer.textContent = timeStr;
+  }
 
-    if (this.challengeFrames.length === 0) {
-      this.showToast("프레임이 감지되지 않았습니다.");
+  stopRecording() {
+    if (!this.isRecording || !this.mediaRecorder) return;
+
+    this.recordBtnText.textContent = "⏳ MP4 영상 인코딩 중...";
+    this.recordBtn.disabled = true;
+
+    clearInterval(this.recordingTimerInterval);
+    this.recordingTimerInterval = null;
+
+    if (this.mediaRecorder.state !== "inactive") {
+      this.mediaRecorder.stop();
+    }
+
+    this.isRecording = false;
+    this.recordBtn.classList.remove("btn-recording");
+    this.recIndicator.style.display = "none";
+    this.recCameraBadge.style.display = "none";
+  }
+
+  finishRecordingAndExport() {
+    this.recordBtn.disabled = false;
+    this.recordBtnText.textContent = "🎥 댄스 영상 녹화 시작 (MP4)";
+
+    if (this.recordedChunks.length === 0) {
+      this.showToast("녹화된 영상 데이터가 없습니다.");
       return;
     }
 
-    // 7초간 수집된 프레임 통계 계산
-    const totalFrames = this.challengeFrames.length;
-    const danceFrames = this.challengeFrames.filter(f => f.isDancing).length;
-    const danceRatio = danceFrames / totalFrames;
+    const durationSec = Math.max(1, Math.round((Date.now() - this.recordingStartTime) / 1000));
+    const avgScore = this.recordingScores.length > 0
+      ? Math.round(this.recordingScores.reduce((a, b) => a + b, 0) / this.recordingScores.length)
+      : (this.lastProcessedResult?.windowMetrics?.avg_score || 0);
 
-    const avgScore = Math.round(
-      this.challengeFrames.reduce((acc, f) => acc + f.metrics.dance_score, 0) / totalFrames
-    );
+    const isDancingVerdict = avgScore >= 48;
+    const mimeType = this.mediaRecorder.mimeType || "video/mp4";
 
-    const bpms = this.challengeFrames.map(f => f.metrics.bpm_estimate).filter(Boolean);
-    const avgBpm = bpms.length > 0
-      ? Math.round(bpms.reduce((a, b) => a + b, 0) / bpms.length)
-      : null;
+    // Blob 생성 및 URL 발급
+    if (this.lastExportedUrl) {
+      URL.revokeObjectURL(this.lastExportedUrl);
+    }
+    this.lastExportedBlob = new Blob(this.recordedChunks, { type: mimeType });
+    this.lastExportedUrl = URL.createObjectURL(this.lastExportedBlob);
 
-    const avgEnergy = (
-      this.challengeFrames.reduce((acc, f) => acc + f.metrics.energy_level, 0) / totalFrames
-    ).toFixed(1);
+    // 모달 데이터 채우기
+    this.exportVideoPlayer.src = this.lastExportedUrl;
+    this.expScore.textContent = `${avgScore}점`;
+    this.expDuration.textContent = `${durationSec}초`;
+    this.expVerdict.textContent = isDancingVerdict ? "🔥 춤 인정 (Dancing)" : "🚶 일반 움직임";
+    this.expVerdict.style.color = isDancingVerdict ? "var(--neon-pink)" : "var(--neon-cyan)";
 
-    // 판정 결과
-    const isDancingFinal = (danceRatio >= 0.45 && avgScore >= 55) || (avgScore >= 65);
-
-    // 마지막 프레임의 체크리스트 또는 과반수 체크리스트
-    const lastChecklist = this.challengeFrames[this.challengeFrames.length - 1].checklist;
-
-    this.challengePendingResult = {
-      is_dancing: isDancingFinal,
-      confidence: Math.round(Math.min(100, Math.max(0, isDancingFinal ? (avgScore * 1.05) : (100 - avgScore)))),
-      checklist: lastChecklist,
-      metrics: {
-        dance_score: avgScore,
-        energy_level: parseFloat(avgEnergy),
-        bpm_estimate: avgBpm,
-        periodicity_score: parseFloat((avgScore / 100).toFixed(2)),
-        analysis_duration_sec: 7.0,
-        fps: this.lastProcessedResult?.metrics?.fps || 30,
-        person_count: this.lastProcessedResult?.metrics?.person_count || 1
-      },
-      notes: isDancingFinal ? "7초 댄스 챌린지 성공 (리듬 및 모션 기준 충족)" : "움직임 또는 리듬감 부족으로 댄스 미충족"
-    };
-
-    // 결과 모달 띄우기
-    this.resIcon.textContent = isDancingFinal ? "🎉🕺" : "🤔🚶";
-    this.resTitle.textContent = isDancingFinal ? "춤 판정 성공!" : "판정: 춤 미충족";
-    this.resVerdict.textContent = isDancingFinal
-      ? "축하합니다! 역동적인 리듬과 모션이 확인되었습니다."
-      : "단순 움직임이거나 리듬 주기성이 부족합니다.";
-    this.resVerdict.style.color = isDancingFinal ? "var(--neon-pink)" : "var(--text-muted)";
-
-    this.resScore.textContent = `${avgScore}점`;
-    this.resBpm.textContent = avgBpm ? `${avgBpm}` : "--";
-    this.resEnergy.textContent = `${avgEnergy}`;
-
-    this.openResultModal();
+    // 모달 오픈
+    this.exportModal.classList.add("open");
+    this.showToast("🎬 MP4 영상 생성이 완료되었습니다!");
   }
 
-  /**
-   * 실시간 현재 상태 1회 스냅샷 서버 저장
-   */
-  async saveCurrentSnapshot() {
-    if (!this.lastProcessedResult) {
-      this.showToast("저장할 분석 결과가 없습니다. 먼저 카메라를 켜주세요.");
+  downloadExportedVideo() {
+    if (!this.lastExportedUrl) {
+      this.showToast("다운로드할 영상이 없습니다.");
       return;
     }
 
-    const { checklist, metrics, isDancing } = this.lastProcessedResult;
+    const dateStr = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const ext = this.lastExportedBlob?.type?.includes("webm") ? "webm" : "mp4";
+    const filename = `DanceCheck_${dateStr}.${ext}`;
 
-    const payload = {
-      is_dancing: isDancing,
-      confidence: isDancing ? metrics.dance_score : (100 - metrics.dance_score),
-      checklist: {
-        is_body_detected: checklist.is_body_detected,
-        is_moving: checklist.is_moving,
-        is_rhythmic: checklist.is_rhythmic,
-        is_dynamic: checklist.is_dynamic,
-        is_sustained: checklist.is_sustained
-      },
-      metrics: {
-        dance_score: metrics.dance_score,
-        energy_level: metrics.energy_level,
-        bpm_estimate: metrics.bpm_estimate,
-        periodicity_score: metrics.periodicity_score,
-        analysis_duration_sec: 2.0,
-        fps: metrics.fps,
-        person_count: metrics.person_count || 1
-      },
-      notes: isDancing ? "실시간 스냅샷: 춤 판정" : "실시간 스냅샷: 춤 아님",
-      user_agent: navigator.userAgent
-    };
+    const a = document.createElement("a");
+    a.href = this.lastExportedUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
 
-    await this.postLogToServer(payload);
+    this.showToast(`⬇️ ${filename} 다운로드를 시작했습니다!`);
   }
 
-  async saveChallengeResult() {
-    if (!this.challengePendingResult) return;
-    const payload = {
-      ...this.challengePendingResult,
-      user_agent: navigator.userAgent
-    };
-    await this.postLogToServer(payload);
-    this.closeResultModal();
-  }
-
-  async postLogToServer(payload) {
-    try {
-      this.saveLogBtn.disabled = true;
-      const res = await fetch("/api/logs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) {
-        throw new Error(`서버 응답 오류 (${res.status})`);
-      }
-
-      const data = await res.json();
-      this.showToast(`💾 판정 결과가 logs.json에 저장되었습니다! (총 ${data.total_records}건)`);
-    } catch (err) {
-      console.error(err);
-      this.showToast(`저장 실패: ${err.message}`);
-    } finally {
-      this.saveLogBtn.disabled = false;
+  closeExportModal() {
+    this.exportModal.classList.remove("open");
+    if (this.exportVideoPlayer) {
+      this.exportVideoPlayer.pause();
     }
-  }
-
-  async fetchLogs() {
-    try {
-      this.historyList.innerHTML = '<div class="empty-state">기록 불러오는 중...</div>';
-      const res = await fetch("/api/logs");
-      if (!res.ok) throw new Error("로그 조회 실패");
-      const logs = await res.json();
-
-      this.historyCount.textContent = `${logs.length}건의 기록`;
-      if (logs.length === 0) {
-        this.historyList.innerHTML = '<div class="empty-state">저장된 판정 기록이 없습니다.</div>';
-        return;
-      }
-
-      this.historyList.innerHTML = logs.map(log => {
-        const isDance = log.is_dancing;
-        const tagClass = isDance ? "dancing" : "not-dancing";
-        const cardClass = isDance ? "dancing" : "not-dancing";
-        const label = isDance ? "🕺 춤 인정" : "🚶 비-댄스";
-        const score = log.metrics?.dance_score || 0;
-        const bpm = log.metrics?.bpm_estimate ? `${log.metrics.bpm_estimate} BPM` : "--";
-        const chk = log.checklist || {};
-
-        return `
-          <div class="log-card ${cardClass}">
-            <div class="log-header">
-              <span class="log-tag ${tagClass}">${label} (${score}점)</span>
-              <span class="log-time">${log.timestamp || ""}</span>
-            </div>
-            <div class="log-metrics">
-              <span>BPM: ${bpm}</span>
-              <span>에너지: ${log.metrics?.energy_level ?? "--"}</span>
-              <span>신뢰도: ${log.confidence}%</span>
-            </div>
-            <div class="log-checklist-pills">
-              <span class="pill ${chk.is_body_detected ? 'passed' : ''}">관절</span>
-              <span class="pill ${chk.is_moving ? 'passed' : ''}">에너지</span>
-              <span class="pill ${chk.is_rhythmic ? 'passed' : ''}">리듬</span>
-              <span class="pill ${chk.is_dynamic ? 'passed' : ''}">가동범위</span>
-              <span class="pill ${chk.is_sustained ? 'passed' : ''}">지속성</span>
-            </div>
-          </div>
-        `;
-      }).join("");
-    } catch (err) {
-      this.historyList.innerHTML = `<div class="empty-state">오류: ${err.message}</div>`;
-    }
-  }
-
-  async clearLogs() {
-    if (!confirm("저장된 모든 판정 기록(logs.json)을 초기화하시겠습니까?")) return;
-    try {
-      const res = await fetch("/api/logs", { method: "DELETE" });
-      if (!res.ok) throw new Error("초기화 실패");
-      this.showToast("모든 기록이 초기화되었습니다.");
-      this.fetchLogs();
-    } catch (err) {
-      this.showToast(`초기화 실패: ${err.message}`);
-    }
-  }
-
-  openHistoryModal() {
-    this.historyModal.classList.add("open");
-    this.fetchLogs();
-  }
-
-  closeHistoryModal() {
-    this.historyModal.classList.remove("open");
-  }
-
-  openResultModal() {
-    this.resultModal.classList.add("open");
-  }
-
-  closeResultModal() {
-    this.resultModal.classList.remove("open");
   }
 
   showToast(message) {
@@ -612,15 +594,16 @@ class DanceCheckApp {
     toast.className = "toast";
     toast.textContent = message;
     this.toastContainer.appendChild(toast);
+
     setTimeout(() => {
-      toast.style.transition = "opacity 0.4s";
       toast.style.opacity = "0";
-      setTimeout(() => toast.remove(), 400);
-    }, 2500);
+      toast.style.transform = "translateY(-10px)";
+      setTimeout(() => toast.remove(), 300);
+    }, 2800);
   }
 }
 
-// 앱 인스턴스 실행
-window.addEventListener("DOMContentLoaded", () => {
+// 앱 실행
+document.addEventListener("DOMContentLoaded", () => {
   new DanceCheckApp();
 });
