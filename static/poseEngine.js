@@ -97,15 +97,29 @@ class PersonTrack {
     const scale = this.torsoHeight;
 
     // 사지 및 코어 2D 등방성 변위 에너지 계산 (aspectRatio 적용)
+    // [핵심] 카메라 센서 노이즈/손떨림 데드밴드(Deadband Filter) 적용
+    // 정지 상태 시 미세 플리커(< threshold)를 완전 0으로 클램핑하여 오인식 원천 차단
     let currentEnergy = 0;
+    let wristVelocity = 0;
     if (this.prevJoints) {
-      const dLw = Math.hypot((lw?.x - this.prevJoints.lwX) * aspectRatio, (lw?.y - this.prevJoints.lwY)) / scale;
-      const dRw = Math.hypot((rw?.x - this.prevJoints.rwX) * aspectRatio, (rw?.y - this.prevJoints.rwY)) / scale;
-      const dLe = Math.hypot((le?.x - this.prevJoints.leX) * aspectRatio, (le?.y - this.prevJoints.leY)) / scale;
-      const dRe = Math.hypot((re?.x - this.prevJoints.reX) * aspectRatio, (re?.y - this.prevJoints.reY)) / scale;
-      const dHip = Math.hypot(((lh?.x + rh?.x)/2 - this.prevJoints.hipX) * aspectRatio, hipCenterY - this.prevJoints.hipY) / scale;
-      const dHead = head ? Math.hypot((head.x - this.prevJoints.headX) * aspectRatio, head.y - this.prevJoints.headY) / scale : 0;
+      const deadband = (dist, thresh) => (dist < thresh ? 0 : dist - thresh * 0.7);
 
+      const rawLw = Math.hypot((lw?.x - this.prevJoints.lwX) * aspectRatio, (lw?.y - this.prevJoints.lwY)) / scale;
+      const rawRw = Math.hypot((rw?.x - this.prevJoints.rwX) * aspectRatio, (rw?.y - this.prevJoints.rwY)) / scale;
+      const rawLe = Math.hypot((le?.x - this.prevJoints.leX) * aspectRatio, (le?.y - this.prevJoints.leY)) / scale;
+      const rawRe = Math.hypot((re?.x - this.prevJoints.reX) * aspectRatio, (re?.y - this.prevJoints.reY)) / scale;
+      const rawHip = Math.hypot(((lh?.x + rh?.x)/2 - this.prevJoints.hipX) * aspectRatio, hipCenterY - this.prevJoints.hipY) / scale;
+      const rawHead = head ? Math.hypot((head.x - this.prevJoints.headX) * aspectRatio, head.y - this.prevJoints.headY) / scale : 0;
+
+      // 관절별 미세 노이즈 데드밴드 (가만히 서 있을 때의 센서 지터 완전 제거)
+      const dLw = deadband(rawLw, 0.024);
+      const dRw = deadband(rawRw, 0.024);
+      const dLe = deadband(rawLe, 0.018);
+      const dRe = deadband(rawRe, 0.018);
+      const dHip = deadband(rawHip, 0.015);
+      const dHead = deadband(rawHead, 0.014);
+
+      wristVelocity = (dLw + dRw) / 2;
       currentEnergy = (dLw * 1.5 + dRw * 1.5 + dLe * 0.9 + dRe * 0.9 + dHip * 2.2 + dHead * 0.8) * 5.0;
     }
 
@@ -138,58 +152,76 @@ class PersonTrack {
     if (this.instantEnergy > this.smoothEnergy) {
       this.smoothEnergy = this.smoothEnergy * 0.15 + this.instantEnergy * 0.85;
     } else {
-      this.smoothEnergy = this.smoothEnergy * 0.93 + this.instantEnergy * 0.07;
+      this.smoothEnergy = this.smoothEnergy * 0.90 + this.instantEnergy * 0.10;
     }
 
-    // 가동 범위 (Dynamic Range, aspectRatio 적용)
+    // 움직임 판정 (노이즈 데드밴드 통과 후 유효 움직임 여부)
+    this.isMoving = this.smoothEnergy >= 0.45 || this.instantEnergy >= 0.55;
+
+    // 사지 가동 범위 (Dynamic Range)
+    // [핵심] 가만히 서 있는 정적 자세(Static Pose) 제외!
+    // 실제로 팔이나 스텝을 활발히 뻗고 움직이는 동작 중에만 인정
     let armSpan = 0;
     if (lw && rw) {
       armSpan = Math.hypot((lw.x - rw.x) * aspectRatio / scale, (lw.y - rw.y) / scale);
     }
     const handsHigh = (lw && ls && lw.y < ls.y) || (rw && rs && rw.y < rs.y);
-    this.isDynamic = armSpan >= 0.95 || handsHigh || this.instantEnergy >= 1.0;
+    const hasLimbMotion = wristVelocity >= 0.035 || this.instantEnergy >= 0.80;
 
-    // 움직임 판정
-    this.isMoving = this.smoothEnergy >= 0.25 || this.instantEnergy >= 0.32;
+    this.isDynamic = this.isMoving && (
+      (handsHigh && hasLimbMotion) ||
+      (armSpan >= 1.25 && hasLimbMotion) ||
+      (this.instantEnergy >= 1.6)
+    );
 
-    // 리듬 및 비트 주기성 판정
+    // 리듬 및 비트 주기성 판정 (움직임 게이팅 적용)
     const rhythm = this.evaluateRhythm();
     this.isRhythmic = rhythm.isRhythmic;
     this.bpm = rhythm.bpm;
 
-    // 춤 상태 유지 래치
-    if (this.isMoving && (this.instantEnergy >= 0.55 || this.smoothEnergy >= 0.50 || this.isRhythmic)) {
-      this.danceHoldFrames = 45;
+    // 춤 상태 유지 래치: 실제 댄스 동작일 때만 활성화
+    const isDanceMotion = this.isMoving && (
+      this.instantEnergy >= 0.85 ||
+      this.smoothEnergy >= 0.70 ||
+      (this.isRhythmic && this.smoothEnergy >= 0.50) ||
+      (this.isDynamic && this.smoothEnergy >= 0.55)
+    );
+
+    if (isDanceMotion) {
+      this.danceHoldFrames = 40;
       this.sustainedDanceFrames = Math.min(120, this.sustainedDanceFrames + 1.5);
     } else if (this.danceHoldFrames > 0) {
       this.danceHoldFrames--;
-      this.sustainedDanceFrames = Math.max(0, this.sustainedDanceFrames - 0.5);
+      this.sustainedDanceFrames = Math.max(0, this.sustainedDanceFrames - 0.7);
     } else {
-      this.sustainedDanceFrames = Math.max(0, this.sustainedDanceFrames - 1.5);
+      this.sustainedDanceFrames = Math.max(0, this.sustainedDanceFrames - 2.0);
     }
 
-    this.isSustained = this.sustainedDanceFrames >= 28;
+    this.isSustained = this.sustainedDanceFrames >= 30;
 
-    // 댄스 점수 산출
-    let score = 15;
-    score += Math.min(45, (this.smoothEnergy / 1.5) * 45);
-    if (this.isDynamic) score += 20;
-    if (this.isRhythmic) score += 20;
-    if (this.isSustained) score += 15;
-
-    if (!this.isMoving && this.danceHoldFrames === 0) {
-      score = Math.min(20, score * 0.4);
+    // 댄스 점수 산출 (3-Tier 구조: 정지 0~25점 / 단순동작 26~49점 / 댄스 50~100점)
+    let score = 0;
+    if (this.isMoving) {
+      score += 15; // 유효 움직임 기본 점수
+      score += Math.min(45, (this.smoothEnergy / 1.8) * 45);
+      if (this.isDynamic) score += 15;
+      if (this.isRhythmic) score += 15;
+      if (this.isSustained) score += 10;
+    } else {
+      // 정지 상태: 0~15점 미만으로 즉시 감쇄
+      score = Math.min(15, this.smoothEnergy * 25);
     }
 
     this.danceScore = Math.min(100, Math.round(score));
     this.isDancing = this.isBodyDetected && (
-      (this.danceHoldFrames > 0 && this.danceScore >= 45) ||
-      (this.danceScore >= 52 && (this.isMoving || this.isRhythmic || this.isDynamic))
+      (this.danceHoldFrames > 0 && this.danceScore >= 50 && this.isMoving) ||
+      (this.danceScore >= 55 && (this.isRhythmic || (this.isDynamic && this.isSustained)))
     );
   }
 
   evaluateRhythm() {
-    if (this.history.length < 24) {
+    // 움직임이 없거나 에너지가 미흡한 정지 상태에서는 리듬 분석 즉시 차단 (가짜 비트 방지)
+    if (!this.isMoving || this.smoothEnergy < 0.40 || this.history.length < 24) {
       return { isRhythmic: false, bpm: null };
     }
 
@@ -198,8 +230,15 @@ class PersonTrack {
     const mean = signal.reduce((a, b) => a + b, 0) / signal.length;
     const centered = signal.map(v => v - mean);
 
+    // 진폭(Peak-to-Peak) 검사: 미세 숨쉬기/손떨림 노이즈 파형 차단
+    const maxVal = Math.max(...centered);
+    const minVal = Math.min(...centered);
+    if ((maxVal - minVal) < 0.07) {
+      return { isRhythmic: false, bpm: null };
+    }
+
     const peaks = [];
-    const minThreshold = 0.022;
+    const minThreshold = 0.035;
 
     for (let i = 2; i < centered.length - 2; i++) {
       if (centered[i] > centered[i - 1] && centered[i] > centered[i - 2] &&
@@ -231,7 +270,7 @@ class PersonTrack {
       if (bpm < 50 || bpm > 240) bpm = null;
     }
 
-    const isRhythmic = isIntervalValid && regularity >= 0.48 && peaks.length >= 3;
+    const isRhythmic = isIntervalValid && regularity >= 0.50 && peaks.length >= 3;
     return { isRhythmic, bpm: isRhythmic ? bpm : null };
   }
 }
@@ -523,20 +562,26 @@ export class PoseEngine {
       (this.rollingWindow.reduce((acc, w) => acc + w.energy, 0) / total).toFixed(2)
     );
 
-    // 3초 평균 기준 충족 항목 수 (충족률 45% 이상인 항목 수)
+    // 3초 평균 기준 충족 항목 수 (충족률 45~50% 이상인 항목 수)
     let activeCount = 0;
     if (rates.body >= 50) activeCount++;
-    if (rates.moving >= 45) activeCount++;
+    if (rates.moving >= 50) activeCount++;
     if (rates.rhythm >= 40) activeCount++;
     if (rates.dynamic >= 40) activeCount++;
     if (rates.sustained >= 45) activeCount++;
 
     // 3초 평균 기준 종합 춤 여부 판정
-    // 순간 멈춤(Freeze)이 있어도 3초 평균 댄스 점수가 50 이상이고 동작/리듬이 유지되면 '춤추는 중' 확정!
-    const isDancingWindow = rates.body >= 40 &&
-      avgScore >= 48 &&
-      rates.moving >= 40 &&
-      (rates.rhythm >= 35 || rates.dynamic >= 35 || rates.sustained >= 40);
+    // [핵심] 가만히 서 있는 사람의 오인식 차단:
+    // 1. 유효 움직임 비율 50% 이상 유지
+    // 2. 3초 평균 에너지 0.65 이상
+    // 3. 3초 평균 댄스 점수 52 이상
+    // 4. 리듬/동적 가동/지속성 중 명확한 댄스 시그널 동반
+    const hasDanceSignal = rates.rhythm >= 35 || rates.dynamic >= 35 || rates.sustained >= 40;
+    const isDancingWindow = rates.body >= 45 &&
+      rates.moving >= 50 &&
+      avgEnergy >= 0.65 &&
+      avgScore >= 52 &&
+      hasDanceSignal;
 
     let verdictText = "🧍 정지 상태 (Idle)";
     if (rates.body < 40) {
@@ -547,7 +592,7 @@ export class PoseEngine {
       } else {
         verdictText = `🔥 춤 감지 중! (Dancing)`;
       }
-    } else if (rates.moving >= 35) {
+    } else if (rates.moving >= 30 || avgEnergy >= 0.40) {
       verdictText = "🚶 단순 행동/움직임 중";
     }
 

@@ -374,7 +374,7 @@ class DanceCheckApp {
       } else {
         this.liveStatusText.textContent = `${personPrefix}🔥 춤추는 중! (3초 평균: ${wm.avg_score}점)`;
       }
-    } else if (wm.rates.moving >= 35) {
+    } else if (wm.rates.moving >= 30 || wm.avg_energy >= 0.40) {
       this.liveStatusBadge.classList.add("moving");
       this.liveStatusText.textContent = `${personPrefix}🚶 단순 행동 중 (움직임 ${wm.rates.moving}%)`;
     } else {
@@ -385,7 +385,7 @@ class DanceCheckApp {
     const bodyActive = wm.rates.body >= 50;
     this.toggleCheckItem(this.chkItems.body, bodyActive, `${wm.rates.body}% (인식됨)`, `${wm.rates.body}% (미인식)`);
 
-    const movingActive = wm.rates.moving >= 45;
+    const movingActive = wm.rates.moving >= 50;
     this.toggleCheckItem(this.chkItems.moving, movingActive, `${wm.rates.moving}% (${wm.avg_energy} E)`, `${wm.rates.moving}% (정지)`);
 
     const rhythmActive = wm.rates.rhythm >= 40;
