@@ -97,30 +97,70 @@ class PersonTrack {
     const scale = this.torsoHeight;
 
     // 사지 및 코어 2D 등방성 변위 에너지 계산 (aspectRatio 적용)
-    // [핵심] 카메라 센서 노이즈/손떨림 데드밴드(Deadband Filter) 적용
-    // 정지 상태 시 미세 플리커(< threshold)를 완전 0으로 클램핑하여 오인식 원천 차단
+    // [핵심 1] 순간이동/트래킹 스왑 이상치 거부 (Anti-Teleportation Gate)
+    // [핵심 2] 멈춰있는 사진/카메라 흔들림 원천 무효화 (Relative Articulation Filter)
     let currentEnergy = 0;
     let wristVelocity = 0;
+    let relativeLimbMotion = 0;
+
     if (this.prevJoints) {
+      // 1. 코어(골반/상체) 이동 벡터 계산
+      const hipDx = ((lh?.x + rh?.x)/2 - this.prevJoints.hipX) * aspectRatio;
+      const hipDy = hipCenterY - this.prevJoints.hipY;
+      const rawHipDist = Math.hypot(hipDx, hipDy) / scale;
+
+      // [순간이동/트래킹 스왑 이상치 거부]
+      // 1/30초만에 코어가 화면의 14% 이상 급격히 튀는 것은 사진 내 리그 스왑/깜빡임이므로 에너지 0 처리
+      if (rawHipDist > 0.14) {
+        this.instantEnergy = 0;
+        this.prevJoints = {
+          lwX: lw?.x || 0, lwY: lw?.y || 0,
+          rwX: rw?.x || 0, rwY: rw?.y || 0,
+          leX: le?.x || 0, leY: le?.y || 0,
+          reX: re?.x || 0, reY: re?.y || 0,
+          hipX: (lh && rh) ? (lh.x + rh.x) / 2 : 0,
+          hipY: hipCenterY,
+          headX: head?.x || 0,
+          headY: head?.y || 0,
+          cx: (ls.x + rs.x + lh.x + rh.x) / 4,
+          cy: (ls.y + rs.y + lh.y + rh.y) / 4
+        };
+        return;
+      }
+
       const deadband = (dist, thresh) => (dist < thresh ? 0 : dist - thresh * 0.7);
 
       const rawLw = Math.hypot((lw?.x - this.prevJoints.lwX) * aspectRatio, (lw?.y - this.prevJoints.lwY)) / scale;
       const rawRw = Math.hypot((rw?.x - this.prevJoints.rwX) * aspectRatio, (rw?.y - this.prevJoints.rwY)) / scale;
       const rawLe = Math.hypot((le?.x - this.prevJoints.leX) * aspectRatio, (le?.y - this.prevJoints.leY)) / scale;
       const rawRe = Math.hypot((re?.x - this.prevJoints.reX) * aspectRatio, (re?.y - this.prevJoints.reY)) / scale;
-      const rawHip = Math.hypot(((lh?.x + rh?.x)/2 - this.prevJoints.hipX) * aspectRatio, hipCenterY - this.prevJoints.hipY) / scale;
       const rawHead = head ? Math.hypot((head.x - this.prevJoints.headX) * aspectRatio, head.y - this.prevJoints.headY) / scale : 0;
 
-      // 관절별 미세 노이즈 데드밴드 (가만히 서 있을 때의 센서 지터 완전 제거)
-      const dLw = deadband(rawLw, 0.024);
-      const dRw = deadband(rawRw, 0.024);
-      const dLe = deadband(rawLe, 0.018);
-      const dRe = deadband(rawRe, 0.018);
-      const dHip = deadband(rawHip, 0.015);
-      const dHead = deadband(rawHead, 0.014);
+      // [사진/카메라 흔들림 원천 차단] 몸통 중심 대비 사지의 '상대적 관절 굴절량'
+      // 사진을 들고 있거나 카메라가 흔들릴 때는 몸 전체가 동일 벡터로 움직이므로 상대 변위는 0
+      const relLw = Math.hypot((lw?.x - this.prevJoints.lwX) * aspectRatio - hipDx, (lw?.y - this.prevJoints.lwY) - hipDy) / scale;
+      const relRw = Math.hypot((rw?.x - this.prevJoints.rwX) * aspectRatio - hipDx, (rw?.y - this.prevJoints.rwY) - hipDy) / scale;
+      const relHead = head ? Math.hypot((head.x - this.prevJoints.headX) * aspectRatio - hipDx, (head.y - this.prevJoints.headY) - hipDy) / scale : 0;
 
-      wristVelocity = (dLw + dRw) / 2;
-      currentEnergy = (dLw * 1.5 + dRw * 1.5 + dLe * 0.9 + dRe * 0.9 + dHip * 2.2 + dHead * 0.8) * 5.0;
+      // 관절별 미세 노이즈 데드밴드 적용
+      const dLw = deadband(rawLw, 0.026);
+      const dRw = deadband(rawRw, 0.026);
+      const dLe = deadband(rawLe, 0.020);
+      const dRe = deadband(rawRe, 0.020);
+      const dHip = deadband(rawHipDist, 0.016);
+      const dHead = deadband(rawHead, 0.016);
+
+      const dRelLw = deadband(relLw, 0.022);
+      const dRelRw = deadband(relRw, 0.022);
+      const dRelHead = deadband(relHead, 0.016);
+
+      relativeLimbMotion = dRelLw + dRelRw + dRelHead;
+      wristVelocity = (dRelLw + dRelRw) / 2;
+
+      // 만약 관절 굴절이 전혀 없는 강체 이동(사진 흔들림 / 카메라 자체 떨림)인 경우 에너지를 85% 감쇄
+      const articulationFactor = relativeLimbMotion < 0.018 ? 0.15 : 1.0;
+
+      currentEnergy = (dLw * 1.5 + dRw * 1.5 + dLe * 0.9 + dRe * 0.9 + dHip * 1.8 * articulationFactor + dHead * 0.8) * 5.0 * articulationFactor;
     }
 
     this.instantEnergy = parseFloat(currentEnergy.toFixed(2));
@@ -133,7 +173,9 @@ class PersonTrack {
       hipX: (lh && rh) ? (lh.x + rh.x) / 2 : 0,
       hipY: hipCenterY,
       headX: head?.x || 0,
-      headY: head?.y || 0
+      headY: head?.y || 0,
+      cx: ((ls?.x || 0.5) + (rs?.x || 0.5) + (lh?.x || 0.5) + (rh?.x || 0.5)) / 4,
+      cy: ((ls?.y || 0.5) + (rs?.y || 0.5) + (lh?.y || 0.5) + (rh?.y || 0.5)) / 4
     };
 
     // 시계열 링 버퍼
@@ -159,19 +201,19 @@ class PersonTrack {
     this.isMoving = this.smoothEnergy >= 0.45 || this.instantEnergy >= 0.55;
 
     // 사지 가동 범위 (Dynamic Range)
-    // [핵심] 가만히 서 있는 정적 자세(Static Pose) 제외!
-    // 실제로 팔이나 스텝을 활발히 뻗고 움직이는 동작 중에만 인정
+    // [핵심] 가만히 서 있는 정적 자세(Static Pose) 및 사진 제외!
+    // 실제로 사지가 상대적으로 활발히 뻗고 움직이는 동작 중에만 인정
     let armSpan = 0;
     if (lw && rw) {
       armSpan = Math.hypot((lw.x - rw.x) * aspectRatio / scale, (lw.y - rw.y) / scale);
     }
     const handsHigh = (lw && ls && lw.y < ls.y) || (rw && rs && rw.y < rs.y);
-    const hasLimbMotion = wristVelocity >= 0.035 || this.instantEnergy >= 0.80;
+    const hasLimbMotion = wristVelocity >= 0.035 || (this.instantEnergy >= 0.80 && relativeLimbMotion >= 0.03);
 
     this.isDynamic = this.isMoving && (
       (handsHigh && hasLimbMotion) ||
       (armSpan >= 1.25 && hasLimbMotion) ||
-      (this.instantEnergy >= 1.6)
+      (this.instantEnergy >= 1.6 && relativeLimbMotion >= 0.04)
     );
 
     // 리듬 및 비트 주기성 판정 (움직임 게이팅 적용)
@@ -337,7 +379,7 @@ export class PoseEngine {
 
   /**
    * MediaPipe Vision 태스크 리졸버 및 PoseLandmarker 초기화
-   * confidence를 0.55로 상향하여 불필요한 유령 박스 생성 억제
+   * confidence를 0.65로 상향하여 멈춰있는 사진/배경 노이즈에서의 허위 리그 생성 억제
    */
   async initialize() {
     const modelAssetPath = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
@@ -354,9 +396,9 @@ export class PoseEngine {
         },
         runningMode: "VIDEO",
         numPoses: 4,
-        minPoseDetectionConfidence: 0.55,
-        minPosePresenceConfidence: 0.55,
-        minTrackingConfidence: 0.55
+        minPoseDetectionConfidence: 0.65,
+        minPosePresenceConfidence: 0.65,
+        minTrackingConfidence: 0.65
       });
 
       this.isReady = true;
@@ -374,9 +416,9 @@ export class PoseEngine {
           },
           runningMode: "VIDEO",
           numPoses: 4,
-          minPoseDetectionConfidence: 0.55,
-          minPosePresenceConfidence: 0.55,
-          minTrackingConfidence: 0.55
+          minPoseDetectionConfidence: 0.65,
+          minPosePresenceConfidence: 0.65,
+          minTrackingConfidence: 0.65
         });
         this.isReady = true;
         return true;
@@ -389,41 +431,63 @@ export class PoseEngine {
   }
 
   /**
-   * [핵심] 한 사람이 여러 명으로 중복 인식되는 현상(NMS) 필터링
-   * 동일인의 어깨/골반 중심점이 근접한 경우 더 신뢰도 높은 1개 포즈만 유지
+   * [핵심] 한 사람이 여러 명으로 중복 인식되거나 멈춘 사진에서 여러 곳에 허위 리그가 뜨는 현상 필터링 (NMS)
+   * 1. 코어(어깨+골반) 가시성이 미흡한 저품질 유령 리그 사전 제거
+   * 2. 신뢰도(가시성) 높은 순으로 정렬하여 최상의 리그 1개만 우선 보존
+   * 3. 동일 인체 중심점/목/골반 반경 0.22 이내 중복 리그 완벽 병합 제거
    */
   filterDuplicatePoses(allPoses, aspectRatio = 1.0) {
-    if (!allPoses || allPoses.length <= 1) return allPoses || [];
+    if (!allPoses || allPoses.length === 0) return [];
+
+    // 1. 유효하지 않은 저품질/배경 허위 리그 사전 필터링
+    const validPoses = allPoses.filter(pose => {
+      const ls = pose[11], rs = pose[12], lh = pose[23], rh = pose[24];
+      if (!ls || !rs || !lh || !rh) return false;
+      const shoulderVis = ((ls.visibility || 0) + (rs.visibility || 0)) / 2;
+      const hipVis = ((lh.visibility || 0) + (rh.visibility || 0)) / 2;
+      const torsoH = Math.abs(((lh.y + rh.y)/2) - ((ls.y + rs.y)/2));
+      // 코어 가시성 미달 또는 비정상적 신체 비율(토막 인식) 제거
+      return shoulderVis >= 0.48 && hipVis >= 0.38 && torsoH >= 0.08;
+    });
+
+    if (validPoses.length <= 1) return validPoses;
+
+    // 2. 가시성(신뢰도) 높은 순으로 정렬 (가장 선명하고 온전한 1개 리그 채택)
+    validPoses.sort((a, b) => {
+      const visA = ((a[11]?.visibility || 0) + (a[12]?.visibility || 0) + (a[23]?.visibility || 0) + (a[24]?.visibility || 0)) / 4;
+      const visB = ((b[11]?.visibility || 0) + (b[12]?.visibility || 0) + (b[23]?.visibility || 0) + (b[24]?.visibility || 0)) / 4;
+      return visB - visA;
+    });
 
     const filtered = [];
-    const duplicateThreshold = 0.18; // 동일 인물 중심점 판별 거리
+    const duplicateThreshold = 0.22; // NMS 중심점 반경 강화
 
-    for (const pose of allPoses) {
+    for (const pose of validPoses) {
       const ls = pose[11], rs = pose[12], lh = pose[23], rh = pose[24];
-      if (!ls || !rs) continue;
-
       const neckX = (ls.x + rs.x) / 2;
       const neckY = (ls.y + rs.y) / 2;
-      const hipX = (lh && rh) ? (lh.x + rh.x) / 2 : neckX;
-      const hipY = (lh && rh) ? (lh.y + rh.y) / 2 : neckY + 0.3;
+      const hipX = (lh.x + rh.x) / 2;
+      const hipY = (lh.y + rh.y) / 2;
       const cx = (neckX + hipX) / 2;
       const cy = (neckY + hipY) / 2;
 
-      // 이미 채택된 포즈들과 비교
+      // 이미 채택된 고품질 포즈들과 비교
       let isDuplicate = false;
       for (const accepted of filtered) {
         const a_ls = accepted[11], a_rs = accepted[12], a_lh = accepted[23], a_rh = accepted[24];
         const a_neckX = (a_ls.x + a_rs.x) / 2;
         const a_neckY = (a_ls.y + a_rs.y) / 2;
-        const a_hipX = (a_lh && a_rh) ? (a_lh.x + a_rh.x) / 2 : a_neckX;
-        const a_hipY = (a_lh && a_rh) ? (a_lh.y + a_rh.y) / 2 : a_neckY + 0.3;
+        const a_hipX = (a_lh.x + a_rh.x) / 2;
+        const a_hipY = (a_lh.y + a_rh.y) / 2;
         const a_cx = (a_neckX + a_hipX) / 2;
         const a_cy = (a_neckY + a_hipY) / 2;
 
         const dist = Math.hypot((cx - a_cx) * aspectRatio, cy - a_cy);
         const neckDist = Math.hypot((neckX - a_neckX) * aspectRatio, neckY - a_neckY);
+        const hipDist = Math.hypot((hipX - a_hipX) * aspectRatio, hipY - a_hipY);
 
-        if (dist < duplicateThreshold || neckDist < 0.14) {
+        // 중심점 거리 0.22 미만, 목 거리 0.18 미만, 또는 골반 거리 0.18 미만이면 동일인 리그로 간주
+        if (dist < duplicateThreshold || neckDist < 0.18 || hipDist < 0.18) {
           isDuplicate = true;
           break;
         }
@@ -629,13 +693,15 @@ export class PoseEngine {
 
     for (const poseData of currentPosesData) {
       let closestTrack = null;
-      let minDistance = 0.35;
+      let minDistance = 0.14; // 엄격한 중심점 매칭 반경 (0.35 -> 0.14): 사진 내 다른 리그로의 점프 스왑 원천 차단
 
       for (const track of activeTracks) {
         if (matchedTrackIds.has(track.id)) continue;
         if (!track.prevJoints) continue;
 
-        const dist = Math.hypot((poseData.cx - track.prevJoints.hipX) * aspectRatio, poseData.cy - track.prevJoints.hipY);
+        const prevX = track.prevJoints.cx ?? track.prevJoints.hipX;
+        const prevY = track.prevJoints.cy ?? track.prevJoints.hipY;
+        const dist = Math.hypot((poseData.cx - prevX) * aspectRatio, poseData.cy - prevY);
         if (dist < minDistance) {
           minDistance = dist;
           closestTrack = track;
