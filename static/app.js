@@ -100,14 +100,14 @@ class DanceCheckApp {
     this.bindEvents();
 
     try {
-      this.modelStatusText.innerHTML = '<span class="spinner"></span> MediaPipe Pose AI 로드 중...';
+      this.modelStatusText.innerHTML = '<span class="spinner"></span> 비전 모델 로드 중...';
       await this.poseEngine.initialize();
-      this.modelStatusText.innerHTML = '✅ AI 모델 준비 완료 (Client 100%)';
+      this.modelStatusText.innerHTML = '<span style="color: var(--status-active); font-weight: 600;">● 온디바이스 엔진 준비 완료</span>';
       this.startBtn.disabled = false;
     } catch (err) {
       console.error(err);
-      this.modelStatusText.innerHTML = '❌ 모델 로드 실패: ' + (err.message || '네트워크 확인 필요');
-      this.showToast("MediaPipe 모델 로드에 실패했습니다. 페이지를 새로고침해주세요.");
+      this.modelStatusText.innerHTML = '<span style="color: var(--status-rec);">● 모델 로드 실패: ' + (err.message || '네트워크 확인 필요') + '</span>';
+      this.showToast("비전 모델 로드에 실패했습니다. 페이지를 새로고침해주세요.");
     }
   }
 
@@ -309,31 +309,31 @@ class DanceCheckApp {
     this.poseEngine.drawLandmarks(ctx, result.allLandmarks, rw, rh, false);
     ctx.restore();
 
-    // 2. 비디오 상단에 Cyberpunk HUD 워터마크 렌더링 (텍스트는 반전되지 않도록 unmirrored 상태에서 그림)
+    // 2. 비디오 상단에 스튜디오 텔레메트리 워터마크 렌더링
     ctx.save();
     const score = result.windowMetrics?.avg_score || result.metrics.dance_score;
     const isDancing = result.windowMetrics?.is_dancing || result.isDancing;
-    const stateText = isDancing ? "🔥 DANCING" : (result.windowMetrics?.rates.moving >= 35 ? "🚶 MOVING" : "🧍 IDLE");
-    const bpmText = result.metrics.bpm_estimate ? ` | ${result.metrics.bpm_estimate} BPM` : "";
+    const stateText = isDancing ? "DANCING" : (result.windowMetrics?.rates.moving >= 35 ? "MOVING" : "IDLE");
+    const bpmText = result.metrics.bpm_estimate ? ` · ${result.metrics.bpm_estimate} BPM` : "";
 
-    // 상단 반투명 HUD 배너 바
-    const bannerW = Math.min(rw - 32, 340);
-    ctx.fillStyle = "rgba(11, 14, 23, 0.78)";
-    ctx.fillRect(16, 16, bannerW, 44);
+    // 상단 반투명 스튜디오 배너 바
+    const bannerW = Math.min(rw - 32, 300);
+    ctx.fillStyle = "rgba(10, 11, 16, 0.88)";
+    ctx.fillRect(16, 16, bannerW, 38);
 
-    // 네온 테두리
-    ctx.lineWidth = 1.5;
-    ctx.strokeStyle = isDancing ? "#ff007f" : "#00f0ff";
-    ctx.strokeRect(16, 16, bannerW, 44);
+    // 정돈된 1px 테두리
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = isDancing ? "rgba(16, 185, 129, 0.5)" : "rgba(255, 255, 255, 0.12)";
+    ctx.strokeRect(16, 16, bannerW, 38);
 
     // 텍스트 출력
-    ctx.font = "bold 13px 'JetBrains Mono', monospace";
-    ctx.fillStyle = isDancing ? "#ff007f" : "#00f0ff";
-    ctx.fillText("⚡ DanceCheck AI", 28, 35);
+    ctx.font = "600 10px 'JetBrains Mono', monospace";
+    ctx.fillStyle = isDancing ? "#10b981" : "#94a3b8";
+    ctx.fillText("DANCECHECK · STUDIO", 26, 30);
 
-    ctx.font = "bold 12px Pretendard, sans-serif";
-    ctx.fillStyle = "#ffffff";
-    ctx.fillText(`[${stateText}] 점수: ${score}%${bpmText}`, 28, 51);
+    ctx.font = "600 12px Pretendard, -apple-system, sans-serif";
+    ctx.fillStyle = "#f8fafc";
+    ctx.fillText(`[${stateText}] 점수 ${score}%${bpmText}`, 26, 45);
 
     ctx.restore();
 
@@ -488,7 +488,7 @@ class DanceCheckApp {
 
     // UI 상태 갱신
     this.recordBtn.classList.add("btn-recording");
-    this.recordBtnText.textContent = "⏹️ 녹화 종료 및 MP4 내보내기";
+    this.recordBtnText.textContent = "녹화 중지 및 MP4 내보내기";
     this.recIndicator.style.display = "inline-flex";
     this.recCameraBadge.style.display = "flex";
 
@@ -498,7 +498,7 @@ class DanceCheckApp {
       this.updateRecordingTimerDisplay(elapsedSec);
     }, 500);
 
-    this.showToast("🎥 댄스 영상 녹화가 시작되었습니다! 자유롭게 춤을 춰보세요!");
+    this.showToast("영상 녹화가 시작되었습니다. (30 FPS)");
   }
 
   updateRecordingTimerDisplay(totalSec) {
@@ -512,7 +512,7 @@ class DanceCheckApp {
   stopRecording() {
     if (!this.isRecording || !this.mediaRecorder) return;
 
-    this.recordBtnText.textContent = "⏳ MP4 영상 인코딩 중...";
+    this.recordBtnText.textContent = "MP4 영상 인코딩 중...";
     this.recordBtn.disabled = true;
 
     clearInterval(this.recordingTimerInterval);
@@ -530,7 +530,7 @@ class DanceCheckApp {
 
   finishRecordingAndExport() {
     this.recordBtn.disabled = false;
-    this.recordBtnText.textContent = "🎥 댄스 영상 녹화 시작 (MP4)";
+    this.recordBtnText.textContent = "댄스 영상 녹화 시작 (MP4)";
 
     if (this.recordedChunks.length === 0) {
       this.showToast("녹화된 영상 데이터가 없습니다.");

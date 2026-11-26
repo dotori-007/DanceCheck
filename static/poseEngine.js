@@ -15,12 +15,12 @@ import {
   FilesetResolver
 } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
-// 다인원 스켈레톤 네온 테마 팔레트 (Cyberpunk Neon)
+// 다인원 모션 캡처 스튜디오 팔레트 (Professional Motion Capture Studio)
 const PERSON_PALETTES = [
-  { stroke: "#00f0ff", glowLine: "rgba(0, 240, 255, 0.35)", head: "#00ffff", joint: "#ff007f", core: "#ffe600" },
-  { stroke: "#39ff14", glowLine: "rgba(57, 255, 20, 0.35)", head: "#39ff14", joint: "#ffe600", core: "#00f0ff" },
-  { stroke: "#ff007f", glowLine: "rgba(255, 0, 127, 0.35)", head: "#ff007f", joint: "#00f0ff", core: "#ffe600" },
-  { stroke: "#ffaa00", glowLine: "rgba(255, 170, 0, 0.35)", head: "#ffaa00", joint: "#39ff14", core: "#ff007f" }
+  { stroke: "#06b6d4", glowLine: "rgba(6, 182, 212, 0.25)", head: "#38bdf8", joint: "#ffffff", core: "#0ea5e9" },
+  { stroke: "#10b981", glowLine: "rgba(16, 185, 129, 0.25)", head: "#34d399", joint: "#ffffff", core: "#059669" },
+  { stroke: "#818cf8", glowLine: "rgba(129, 140, 248, 0.25)", head: "#a5b4fc", joint: "#ffffff", core: "#6366f1" },
+  { stroke: "#f59e0b", glowLine: "rgba(245, 158, 11, 0.25)", head: "#fbbf24", joint: "#ffffff", core: "#d97706" }
 ];
 
 /**

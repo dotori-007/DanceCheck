@@ -5,46 +5,66 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="theme-color" content="#0a0c14">
-  <title>DanceCheck - 실시간 댄스 분석 & MP4 내보내기</title>
+  <meta name="theme-color" content="#090a0f">
+  <title>DanceCheck · 모션 분석 스튜디오</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Pretendard:wght@400;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <div id="app" class="app-container">
-    <!-- 상단 헤더 바 -->
+    <!-- 상단 내비게이션 바 -->
     <header class="app-header">
       <div class="brand">
-        <span class="brand-icon">⚡</span>
-        <h1 class="brand-title">DanceCheck</h1>
+        <span class="brand-title">DanceCheck</span>
+        <span class="brand-tag">STUDIO</span>
       </div>
       <div class="header-actions">
         <span id="rec-indicator" class="badge badge-rec" style="display: none;">
-          <span class="rec-dot"></span> REC <span id="rec-timer">00:00</span>
+          <span class="rec-dot"></span>
+          <span>REC</span>
+          <span id="rec-timer" class="rec-time">00:00</span>
         </span>
-        <span id="fps-badge" class="badge badge-fps">FPS: --</span>
-        <button id="camera-flip-btn" class="icon-btn" title="카메라 전환" aria-label="카메라 전환">
-          🔄
+        <span id="fps-badge" class="badge badge-fps">FPS --</span>
+        <button id="camera-flip-btn" class="icon-btn" title="전면/후면 카메라 전환" aria-label="카메라 전환">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 10c0-4.418-3.582-8-8-8s-8 3.582-8 8c0 1.5.4 2.9 1.1 4.1L3 16l4.5-.5L8 20l1.9-1.9C10.7 18.6 11.3 19 12 19c4.418 0 8-3.582 8-8z"/>
+            <path d="M14 8l3 3-3 3"/>
+            <path d="M10 16l-3-3 3-3"/>
+          </svg>
         </button>
       </div>
     </header>
 
-    <!-- 카메라 & 비전 뷰포트 영역 -->
+    <!-- 메인 뷰포트 (카메라 뷰파인더 & 비전 오버레이) -->
     <main class="viewport-section">
       <div class="camera-card">
         <video id="webcam" playsinline webkit-playsinline autoplay muted></video>
         <canvas id="output-canvas"></canvas>
 
-        <!-- 시작 전 및 로딩 오버레이 -->
+        <!-- 뷰파인더 코너 가이드 (프로 카메라 UI) -->
+        <div class="viewfinder-guides" aria-hidden="true">
+          <span class="corner tl"></span>
+          <span class="corner tr"></span>
+          <span class="corner bl"></span>
+          <span class="corner br"></span>
+        </div>
+
+        <!-- 카메라 준비 및 안내 오버레이 -->
         <div id="start-overlay" class="overlay-screen active">
-          <div class="overlay-content">
-            <div class="pulse-ring">🕺</div>
-            <h2>DanceCheck AI</h2>
-            <p>카메라 앞에서 자유롭게 춤을 추면<br>브라우저 AI가 실시간으로 분석합니다.</p>
+          <div class="overlay-card">
+            <div class="overlay-icon-wrap">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                <circle cx="12" cy="13" r="4"/>
+              </svg>
+            </div>
+            <h2>실시간 모션 분석 시작</h2>
+            <p>전신이 화면에 보이도록 기기를 거치하세요.<br>영상은 외부로 전송되지 않고 기기 내에서만 처리됩니다.</p>
             <div id="model-status" class="model-status-text">
-              <span class="spinner"></span> AI 모델 초기화 중...
+              <span class="spinner"></span>
+              <span>비전 엔진 초기화 중...</span>
             </div>
             <button id="start-btn" class="btn btn-primary" disabled>
               카메라 시작
@@ -52,91 +72,104 @@
           </div>
         </div>
 
-        <!-- 녹화 중 플로팅 뱃지 -->
+        <!-- 녹화 중 상단 플로팅 뱃지 -->
         <div id="rec-camera-badge" class="rec-camera-badge" style="display: none;">
           <span class="rec-dot-pulse"></span>
           <span>REC <span id="rec-camera-timer">00:00</span></span>
         </div>
 
-        <!-- 실시간 판정 상태 플로팅 배지 (최근 3초 롤링 윈도우 평균) -->
+        <!-- 실시간 판정 상태 텔레메트리 바 (최근 3초 이동 평균) -->
         <div class="live-status-badge" id="live-status-badge">
           <span class="status-dot"></span>
           <span id="live-status-text">인물 감지 대기 중</span>
         </div>
 
-        <!-- 실시간 댄스 게이지 바 -->
+        <!-- 모션 강도 측정 게이지 -->
         <div class="gauge-container">
           <div class="gauge-header">
-            <span class="gauge-label">3초 평균 DANCE INTENSITY</span>
+            <span class="gauge-label">모션 강도 (3초 평균)</span>
             <span class="gauge-val" id="dance-score-text">0%</span>
           </div>
-          <div class="gauge-bar-bg">
+          <div class="gauge-track">
             <div class="gauge-bar-fill" id="dance-score-bar"></div>
           </div>
         </div>
       </div>
     </main>
 
-    <!-- 실시간 체크리스트 HUD & 녹화 컨트롤 -->
+    <!-- 모션 분석 지표 대시보드 & 제어 -->
     <section class="controls-section">
       <div class="checklist-panel">
         <div class="panel-header">
-          <span class="panel-title">객관적 춤 판정 (최근 3초 평균)</span>
-          <span id="checklist-counter" class="badge">3초 평균: 0 / 5 충족</span>
+          <div>
+            <h2 class="panel-title">모션 분석 지표</h2>
+            <p class="panel-sub">최근 3초 롤링 윈도우 기준 충족도</p>
+          </div>
+          <span id="checklist-counter" class="counter-badge">0 / 5 충족</span>
         </div>
 
         <ul class="checklist-items">
           <li class="check-item" id="chk-body">
             <div class="check-indicator"></div>
-            <div class="check-info">
-              <span class="item-name">전신 관절 안정 인식</span>
-              <span class="item-desc">어깨 & 골반 등 코어 관절 식별</span>
+            <div class="check-content">
+              <div class="item-title-row">
+                <span class="item-name">전신 코어 인식</span>
+                <span class="item-state" id="chk-body-state">0% 미인식</span>
+              </div>
+              <span class="item-desc">어깨 및 골반 관절의 공간상 위치 식별</span>
             </div>
-            <span class="item-state" id="chk-body-state">0% 미인식</span>
           </li>
 
           <li class="check-item" id="chk-moving">
             <div class="check-indicator"></div>
-            <div class="check-info">
-              <span class="item-name">운동 에너지 역치 초과</span>
-              <span class="item-desc">단순 미세 떨림/정지 상태 필터링</span>
+            <div class="check-content">
+              <div class="item-title-row">
+                <span class="item-name">유효 운동 변위</span>
+                <span class="item-state" id="chk-moving-state">0% 정지</span>
+              </div>
+              <span class="item-desc">정지 및 미세 떨림을 제외한 실제 동작 발생</span>
             </div>
-            <span class="item-state" id="chk-moving-state">0% 정지</span>
           </li>
 
           <li class="check-item" id="chk-rhythm">
             <div class="check-indicator"></div>
-            <div class="check-info">
-              <span class="item-name">리듬 주기성 & 바운스</span>
-              <span class="item-desc" id="bpm-display">주기적 비트/진동 패턴 검출</span>
+            <div class="check-content">
+              <div class="item-title-row">
+                <span class="item-name">리듬 주기성</span>
+                <span class="item-state" id="chk-rhythm-state">0% 무작위</span>
+              </div>
+              <span class="item-desc" id="bpm-display">주기적 바운스 및 템포 패턴 일치</span>
             </div>
-            <span class="item-state" id="chk-rhythm-state">0% 무작위</span>
           </li>
 
           <li class="check-item" id="chk-dynamic">
             <div class="check-indicator"></div>
-            <div class="check-info">
-              <span class="item-name">사지 가동 범위 (Range)</span>
-              <span class="item-desc">손/팔/스텝의 역동적 공간 궤적</span>
+            <div class="check-content">
+              <div class="item-title-row">
+                <span class="item-name">사지 가동 반경</span>
+                <span class="item-state" id="chk-dynamic-state">0% 제한적</span>
+              </div>
+              <span class="item-desc">팔과 스텝의 역동적인 궤적 확장</span>
             </div>
-            <span class="item-state" id="chk-dynamic-state">0% 제한적</span>
           </li>
 
           <li class="check-item" id="chk-sustained">
             <div class="check-indicator"></div>
-            <div class="check-info">
-              <span class="item-name">지속 시간 (Sustained)</span>
-              <span class="item-desc">일회성 동작이 아닌 1.5초 이상 연속성</span>
+            <div class="check-content">
+              <div class="item-title-row">
+                <span class="item-name">동작 지속성</span>
+                <span class="item-state" id="chk-sustained-state">0% 부족</span>
+              </div>
+              <span class="item-desc">단발성 움직임이 아닌 1.5초 이상의 연속 댄스</span>
             </div>
-            <span class="item-state" id="chk-sustained-state">0% 부족</span>
           </li>
         </ul>
       </div>
 
-      <!-- MP4 녹화 액션 버튼 -->
+      <!-- 녹화 제어 액션 -->
       <div class="action-buttons">
         <button id="record-btn" class="btn btn-record">
-          <span class="btn-icon">🎥</span>
+          <span class="rec-button-dot" aria-hidden="true"></span>
           <span id="record-btn-text">댄스 영상 녹화 시작 (MP4)</span>
         </button>
       </div>
@@ -146,8 +179,11 @@
     <div id="export-modal" class="modal-backdrop">
       <div class="modal-sheet export-sheet">
         <div class="modal-header">
-          <h2>🎬 댄스 영상 내보내기 (MP4)</h2>
-          <button id="export-close-btn" class="close-btn">&times;</button>
+          <div>
+            <h2>녹화 영상 미리보기</h2>
+            <p class="modal-sub">AI 분석 데이터가 합성된 MP4 비디오</p>
+          </div>
+          <button id="export-close-btn" class="close-btn" aria-label="닫기">&times;</button>
         </div>
 
         <div class="export-preview-container">
@@ -164,14 +200,19 @@
             <span class="stat-value" id="exp-duration">--s</span>
           </div>
           <div class="stat-box">
-            <span class="stat-label">춤 판정 결과</span>
-            <span class="stat-value" id="exp-verdict" style="font-size: 0.95rem;">--</span>
+            <span class="stat-label">판정 결과</span>
+            <span class="stat-value" id="exp-verdict">--</span>
           </div>
         </div>
 
         <div class="result-actions">
-          <button id="download-mp4-btn" class="btn btn-primary btn-glow">
-            ⬇️ MP4 비디오 저장/다운로드
+          <button id="download-mp4-btn" class="btn btn-primary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            MP4 파일 다운로드
           </button>
           <button id="export-cancel-btn" class="btn btn-secondary">
             닫기
